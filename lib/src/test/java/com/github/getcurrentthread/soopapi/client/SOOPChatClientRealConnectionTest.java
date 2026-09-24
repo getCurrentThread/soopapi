@@ -2,7 +2,11 @@ package com.github.getcurrentthread.soopapi.client;
 
 import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.io.IOException;
 import java.io.PrintWriter;
@@ -10,26 +14,33 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.Deque;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.FileHandler;
 import java.util.logging.Handler;
 import java.util.logging.Level;
+import java.util.logging.LogRecord;
 import java.util.logging.Logger;
 import java.util.logging.SimpleFormatter;
 
@@ -37,11 +48,21 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 import org.junit.jupiter.api.function.Executable;
 
+import com.github.getcurrentthread.soopapi.api.SOOPAuth;
+import com.github.getcurrentthread.soopapi.api.SOOPHttpClient;
+import com.github.getcurrentthread.soopapi.api.SOOPLive;
+import com.github.getcurrentthread.soopapi.api.model.AuthCookie;
+import com.github.getcurrentthread.soopapi.api.model.LiveDetail;
 import com.github.getcurrentthread.soopapi.config.SOOPChatConfig;
+import com.github.getcurrentthread.soopapi.decoder.MessageDispatcher;
 import com.github.getcurrentthread.soopapi.event.ChatEvent;
 import com.github.getcurrentthread.soopapi.event.model.*;
+import com.github.getcurrentthread.soopapi.exception.AdultBroadcastException;
+import com.github.getcurrentthread.soopapi.exception.ConnectionException;
+import com.github.getcurrentthread.soopapi.util.SOOPChatUtils;
 import com.google.gson.Gson;
 import com.google.gson.reflect.TypeToken;
 
@@ -53,6 +74,26 @@ class SOOPChatClientRealConnectionTest {
     static final int TOP_N = 10;
     static final int MONITOR_SECONDS = 150;
     static final String LOG_DIR = "test-logs";
+
+    /**
+     * 방송 목록·방송 정보 조회 하나에 주는 시간. 19금 익명 연결 테스트의 connectToChat() 대기(15초)보다 짧아야 조회 실패가 시간 초과로 가려지지
+     * 않는다. 19금 로그인 테스트의 로그인과 채팅 세션(connectionTimeout)에도 쓴다.
+     */
+    static final Duration LOOKUP_TIMEOUT = Duration.ofSeconds(10);
+
+    /** 익명 조회로 19금 여부를 확인해 볼 목록상 19금 방송의 최대 개수. */
+    static final int ADULT_CANDIDATES = 10;
+
+    /** 19금 로그인 테스트에 쓸 연령 인증된 계정. 둘 다 있어야 그 테스트가 돈다. */
+    static final String TEST_ID_ENV = "SOOP_TEST_ID";
+
+    static final String TEST_PW_ENV = "SOOP_TEST_PW";
+
+    /** 비어 있지 않은 값. 맞지 않으면 JUnit이 건너뛴 이유에 값을 그대로 적으므로, 줄바꿈이 든 값도 맞도록 (?s)를 붙인다. */
+    static final String NON_EMPTY = "(?s).+";
+
+    /** INFO 미만의 기록도 파일에 남기는 로거의 이름 접두사(이 라이브러리와 테스트). */
+    static final String LIBRARY_LOGGERS = "com.github.getcurrentthread.soopapi.";
 
     static final Logger logger = Logger.getLogger(SOOPChatClientRealConnectionTest.class.getName());
     static final Logger rootLogger = Logger.getLogger("");
@@ -173,6 +214,7 @@ class SOOPChatClientRealConnectionTest {
         normalHandler = new FileHandler(LOG_DIR + "/normal.log", false);
         normalHandler.setLevel(Level.ALL);
         normalHandler.setFormatter(new SimpleFormatter());
+        normalHandler.setFilter(SOOPChatClientRealConnectionTest::isRecorded);
         rootLogger.addHandler(normalHandler);
 
         errorHandler = new FileHandler(LOG_DIR + "/error.log", false);
@@ -197,6 +239,16 @@ class SOOPChatClientRealConnectionTest {
             }
         }
         rootLogger.setLevel(originalLevel);
+    }
+
+    /**
+     * INFO 미만은 이 라이브러리와 테스트의 기록만 파일에 남긴다. JUnit은 조건 평가 결과를 FINER로 남기는데, 켜진
+     * {@code @EnabledIfEnvironmentVariable}의 결과에는 환경 변수 값(SOOP_TEST_PW 포함)이 그대로 들어간다.
+     */
+    static boolean isRecorded(LogRecord record) {
+        String name = record.getLoggerName();
+        return record.getLevel().intValue() >= Level.INFO.intValue()
+                || (name != null && name.startsWith(LIBRARY_LOGGERS));
     }
 
     @Test
@@ -446,6 +498,273 @@ class SOOPChatClientRealConnectionTest {
         logger.info("=== Test complete ===");
     }
 
+    /**
+     * 19금 방송 하나에 익명으로 연결하면 방송 정보 조회에서 {@link AdultBroadcastException}으로 끝나야 한다. 재시도 없이
+     * DISCONNECTED가 한 번 온다. 익명 조회가 19금으로 막히는 방송이 지금 없으면 건너뛴다(skipped).
+     */
+    @Test
+    void testAdultBroadcastFailsAnonymously() throws Exception {
+        Map<String, Object> target = adultOnlyTarget();
+
+        String bid = (String) target.get("user_id");
+        String bno = String.valueOf(target.get("broad_no"));
+        List<DisconnectedEvent> disconnects = new CopyOnWriteArrayList<>();
+        AtomicInteger reconnecting = new AtomicInteger();
+
+        SOOPChatConfig config =
+                new SOOPChatConfig.Builder()
+                        .bid(bid)
+                        .bno(bno)
+                        .connectionTimeout(LOOKUP_TIMEOUT)
+                        .build();
+        try (SOOPChatClient client = new SOOPChatClient(config)) {
+            client.on(ChatEvent.DISCONNECTED, (DisconnectedEvent e) -> disconnects.add(e));
+            client.on(
+                    ChatEvent.RECONNECTING,
+                    (ReconnectingEvent e) -> reconnecting.incrementAndGet());
+
+            ExecutionException ex =
+                    assertThrows(
+                            ExecutionException.class,
+                            () -> client.connectToChat().get(15, TimeUnit.SECONDS));
+            Throwable failure = SOOPChatUtils.unwrapCompletionException(ex.getCause());
+            // 늦게 오는 DISCONNECTED·RECONNECTING이 있는지 잠시 더 본다.
+            Thread.sleep(2_000);
+
+            boolean typedCause =
+                    failure instanceof ConnectionException
+                            && failure.getCause() instanceof AdultBroadcastException;
+            boolean causedByError =
+                    !disconnects.isEmpty() && disconnects.getFirst().causedByError();
+            boolean reasonMentions19 =
+                    !disconnects.isEmpty() && disconnects.getFirst().reason().contains("19+");
+            logger.info(
+                    String.format(
+                            "[%s] 19+ anonymous probe: typedCause=%s, DISCONNECTED=%d,"
+                                    + " causedByError=%s, reasonMentions19=%s, RECONNECTING=%d",
+                            bid,
+                            typedCause,
+                            disconnects.size(),
+                            causedByError,
+                            reasonMentions19,
+                            reconnecting.get()));
+
+            assertAll(
+                    () ->
+                            assertTrue(
+                                    typedCause,
+                                    "connectToChat() should fail with ConnectionException"
+                                            + " caused by AdultBroadcastException"),
+                    () -> assertEquals(1, disconnects.size(), "one DISCONNECTED per session"),
+                    () -> assertTrue(causedByError, "DISCONNECTED should be caused by an error"),
+                    () -> assertTrue(reasonMentions19, "DISCONNECTED reason should explain 19+"),
+                    () -> assertEquals(0, reconnecting.get(), "19+ lookup must not be retried"));
+        }
+    }
+
+    /**
+     * 연령 인증된 계정의 로그인 쿠키로는 19금 방송의 방송 정보 조회와 채팅 연결이 된다. 계정은 환경 변수 SOOP_TEST_ID·SOOP_TEST_PW로 받고, 둘 중
+     * 하나라도 없거나 비어 있으면 건너뛴다(skipped). 익명 조회가 19금으로 막히는 방송이 지금 없어도 로그인하기 전에 건너뛴다. 채팅·귓말은 보내지 않는다. 계정
+     * ID·비밀번호·쿠키·LOGIN의 userId·채팅 본문은 로그와 실패 메시지에 남기지 않고 개수와 참·거짓만 남긴다.
+     */
+    @Test
+    @EnabledIfEnvironmentVariable(named = TEST_ID_ENV, matches = NON_EMPTY)
+    @EnabledIfEnvironmentVariable(named = TEST_PW_ENV, matches = NON_EMPTY)
+    void testAdultBroadcastWithAgeVerifiedLogin() throws Exception {
+        Map<String, Object> target = adultOnlyTarget();
+
+        String password = System.getenv(TEST_PW_ENV);
+        AuthCookie cookie = signIn(System.getenv(TEST_ID_ENV), password);
+        logger.info("=== 19+ login: signed in ===");
+
+        String bid = (String) target.get("user_id");
+        String bno = String.valueOf(target.get("broad_no"));
+        String ftk = detailWithLogin(bid, bno, cookie);
+        logger.info("[" + bid + "] 19+ login: detail() with the login cookie succeeded");
+
+        AtomicInteger joins = new AtomicInteger();
+        AtomicBoolean loginWithUserId = new AtomicBoolean();
+        AtomicLong chats = new AtomicLong();
+        AtomicInteger reconnecting = new AtomicInteger();
+        List<DisconnectedEvent> disconnects = new CopyOnWriteArrayList<>();
+        boolean ready;
+
+        SOOPChatConfig config =
+                new SOOPChatConfig.Builder()
+                        .authCookie(cookie)
+                        .bid(bid)
+                        .bno(bno)
+                        .connectionTimeout(LOOKUP_TIMEOUT)
+                        .build();
+        // 수신 패킷 원문을 FINE으로 남기는 로그를 이 세션 동안 끈다. LOGIN 응답에는 계정 ID가, 채팅 패킷에는 본문이 들어 있다.
+        Logger dispatcherLogger = Logger.getLogger(MessageDispatcher.class.getName());
+        Level dispatcherLevel = dispatcherLogger.getLevel();
+        dispatcherLogger.setLevel(Level.INFO);
+        try (SOOPChatClient client = new SOOPChatClient(config)) {
+            client.on(ChatEvent.JOIN_CHANNEL, (JoinChannelEvent e) -> joins.incrementAndGet());
+            // userId는 계정 ID이므로 값은 두지 않고 비어 있지 않은지만 기록한다.
+            client.on(
+                    ChatEvent.LOGIN,
+                    (LoginEvent e) -> {
+                        if (e.userId() != null && !e.userId().isEmpty()) {
+                            loginWithUserId.set(true);
+                        }
+                    });
+            client.on(ChatEvent.CHAT_MESSAGE, (ChatMessageEvent e) -> chats.incrementAndGet());
+            client.on(
+                    ChatEvent.RECONNECTING,
+                    (ReconnectingEvent e) -> reconnecting.incrementAndGet());
+            client.on(ChatEvent.DISCONNECTED, (DisconnectedEvent e) -> disconnects.add(e));
+
+            client.connectToChat();
+            ready = completesWithin(client.ready(), 15, bid + " ready()");
+            // 채팅이 들어오는 동안 잠시 머문다. 이 테스트는 채팅을 보내지 않는다.
+            Thread.sleep(10_000);
+            client.disconnect();
+
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (disconnects.isEmpty() && System.nanoTime() < deadline) {
+                Thread.sleep(50);
+            }
+            // 늦게 오는 DISCONNECTED·RECONNECTING이 있는지 잠시 더 본다.
+            Thread.sleep(2_000);
+        } finally {
+            dispatcherLogger.setLevel(dispatcherLevel);
+        }
+
+        boolean clientInitiated =
+                !disconnects.isEmpty() && disconnects.getFirst().isClientInitiated();
+        boolean causedByError = !disconnects.isEmpty() && disconnects.getFirst().causedByError();
+        logger.info(
+                String.format(
+                        "[%s] 19+ login session: ready=%s, JOIN_CHANNEL=%d, loginWithUserId=%s,"
+                                + " chats=%d, RECONNECTING=%d, DISCONNECTED=%d,"
+                                + " clientInitiated=%s, causedByError=%s",
+                        bid,
+                        ready,
+                        joins.get(),
+                        loginWithUserId.get(),
+                        chats.get(),
+                        reconnecting.get(),
+                        disconnects.size(),
+                        clientInitiated,
+                        causedByError));
+
+        Map<String, String> secrets = new LinkedHashMap<>();
+        secrets.put("The password", password);
+        secrets.put("AuthTicket", cookie.authTicket());
+        secrets.put("UserTicket", cookie.userTicket());
+        secrets.put("_au", cookie.au());
+        secrets.put("RDB", cookie.rdb());
+        secrets.put("FTK", ftk);
+        assertAll(
+                () -> assertTrue(ready, "ready() should complete within 15s"),
+                () -> assertTrue(joins.get() >= 1, "JOIN_CHANNEL should arrive"),
+                () -> assertTrue(loginWithUserId.get(), "LOGIN should carry the signed-in user"),
+                () -> assertEquals(0, reconnecting.get(), "no RECONNECTING"),
+                () -> assertEquals(1, disconnects.size(), "one DISCONNECTED per session"),
+                () -> assertTrue(clientInitiated, "DISCONNECTED should be client-initiated"),
+                () -> assertFalse(causedByError, "DISCONNECTED should not be caused by an error"),
+                () -> assertNotLogged(secrets));
+    }
+
+    /** SOOPAuth로 로그인해 인증된 쿠키를 돌려준다. 실패 메시지에는 예외 종류만 남긴다(계정 정보나 서버 응답이 실리지 않도록 원인도 붙이지 않는다). */
+    private static AuthCookie signIn(String id, String password) throws Exception {
+        AuthCookie cookie;
+        try (SOOPHttpClient http = new SOOPHttpClient(LOOKUP_TIMEOUT)) {
+            cookie = new SOOPAuth(http).signIn(id, password).get(15, TimeUnit.SECONDS);
+        } catch (ExecutionException e) {
+            return fail("Sign-in failed: " + e.getCause().getClass().getSimpleName());
+        }
+        assertTrue(cookie.isAuthenticated(), "Sign-in did not return an authenticated AuthCookie");
+        return cookie;
+    }
+
+    /** 로그인 쿠키로 방송 정보를 조회해 FTK를 돌려준다. 실패하면 예외 종류만 남기고 테스트를 실패시킨다. */
+    private static String detailWithLogin(String bid, String bno, AuthCookie cookie)
+            throws Exception {
+        try (SOOPHttpClient http = new SOOPHttpClient(LOOKUP_TIMEOUT)) {
+            LiveDetail detail =
+                    new SOOPLive(http).detail(bid, bno, cookie).get(15, TimeUnit.SECONDS);
+            assertEquals(1, detail.result(), "detail() with the login cookie should succeed");
+            return detail.ftk();
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            return fail(
+                    "["
+                            + bid
+                            + "] detail() with the login cookie failed: "
+                            + cause.getClass().getSimpleName()
+                            + (cause instanceof AdultBroadcastException
+                                    ? " (is the test account age-verified?)"
+                                    : ""));
+        }
+    }
+
+    /**
+     * 로그 파일(normal.log·error.log)에 자격 증명 값이 남지 않았는지 본다. 값은 실패 메시지에 싣지 않는다. 짧은 값은 다른 기록과 우연히 겹칠 수 있어
+     * 8자 이상만 본다.
+     */
+    private static void assertNotLogged(Map<String, String> secrets) throws IOException {
+        normalHandler.flush();
+        errorHandler.flush();
+        List<Executable> checks = new ArrayList<>();
+        for (String file : List.of("normal.log", "error.log")) {
+            String log =
+                    new String(Files.readAllBytes(Path.of(LOG_DIR, file)), StandardCharsets.UTF_8);
+            secrets.forEach(
+                    (name, value) -> {
+                        if (value != null && value.length() >= 8) {
+                            checks.add(
+                                    () ->
+                                            assertFalse(
+                                                    log.contains(value),
+                                                    name + " was written to " + file));
+                        }
+                    });
+        }
+        assertAll(checks);
+    }
+
+    /** 목록에서 익명 조회가 실제로 19금으로 막히는 방송 하나를 고른다. 지금 없으면 건너뛴다(skipped). */
+    private Map<String, Object> adultOnlyTarget() throws Exception {
+        List<Map<String, Object>> adults =
+                fetchBroadcasts().stream()
+                        .filter(SOOPChatClientRealConnectionTest::isAdult)
+                        .toList();
+        logger.info("=== 19+ broadcasts in the list: " + adults.size() + " ===");
+        Map<String, Object> target = firstAdultOnly(adults);
+        if (target == null) {
+            logger.info("No broadcast rejects anonymous requests as 19+; skipping the 19+ probe");
+        }
+        assumeTrue(target != null, "No live broadcast rejects anonymous requests as 19+");
+        return target;
+    }
+
+    /**
+     * 방송 목록의 broad_grade는 캐시된 값이라 지금의 19금 여부와 다를 수 있다. 앞에서부터 {@link #ADULT_CANDIDATES}개까지 익명으로 조회해
+     * {@link AdultBroadcastException}으로 실패하는 첫 방송을 돌려준다. 없으면 null.
+     */
+    private static Map<String, Object> firstAdultOnly(List<Map<String, Object>> adults) {
+        try (SOOPHttpClient http = new SOOPHttpClient(LOOKUP_TIMEOUT)) {
+            SOOPLive live = new SOOPLive(http);
+            for (Map<String, Object> broad :
+                    adults.subList(0, Math.min(ADULT_CANDIDATES, adults.size()))) {
+                String bid = (String) broad.get("user_id");
+                try {
+                    live.detail(bid, String.valueOf(broad.get("broad_no"))).join();
+                    logger.info("[" + bid + "] listed as 19+ but open to anonymous requests");
+                } catch (CompletionException e) {
+                    if (e.getCause() instanceof AdultBroadcastException) {
+                        return broad;
+                    }
+                    logger.log(Level.INFO, "[" + bid + "] lookup failed", e.getCause());
+                }
+            }
+        }
+        return null;
+    }
+
     /** future가 제한 시간 안에 정상 완료되면 true. 실패나 시간 초과는 로그로 남긴다. */
     private static boolean completesWithin(CompletableFuture<?> future, long seconds, String what) {
         try {
@@ -473,12 +792,29 @@ class SOOPChatClientRealConnectionTest {
         return probe.disconnected;
     }
 
-    @SuppressWarnings("unchecked")
+    /** 익명 연결은 19금 방송의 채팅에 들어갈 수 없으므로 목록에서 빼고 시청자 수 상위 {@link #TOP_N}개를 고른다. */
     private List<Map<String, Object>> fetchTopStreamers() throws Exception {
-        HttpClient httpClient = HttpClient.newHttpClient();
+        List<Map<String, Object>> broads = fetchBroadcasts();
+        List<Map<String, Object>> open = broads.stream().filter(broad -> !isAdult(broad)).toList();
+        logger.info("Skipped 19+ broadcasts: " + (broads.size() - open.size()));
+        return open.subList(0, Math.min(TOP_N, open.size()));
+    }
+
+    /** 방송 목록의 broad_grade가 19면 19금 방송이다. 목록에 따라 문자열이나 숫자로 온다. */
+    private static boolean isAdult(Map<String, Object> broad) {
+        Object grade = broad.get("broad_grade");
+        if (grade instanceof Number n) return n.intValue() == 19;
+        return "19".equals(String.valueOf(grade));
+    }
+
+    /** 방송 목록 전체를 시청자 수 내림차순으로 돌려준다. */
+    @SuppressWarnings("unchecked")
+    private List<Map<String, Object>> fetchBroadcasts() throws Exception {
+        HttpClient httpClient = HttpClient.newBuilder().connectTimeout(LOOKUP_TIMEOUT).build();
         HttpRequest request =
                 HttpRequest.newBuilder()
                         .uri(URI.create(BROAD_LIST_URL))
+                        .timeout(LOOKUP_TIMEOUT)
                         .header("User-Agent", "Mozilla/5.0")
                         .GET()
                         .build();
@@ -507,7 +843,7 @@ class SOOPChatClientRealConnectionTest {
                                 })
                         .reversed());
 
-        return broads.subList(0, Math.min(TOP_N, broads.size()));
+        return broads;
     }
 
     private static String formatEventLog(String bid, BaseEvent event) {

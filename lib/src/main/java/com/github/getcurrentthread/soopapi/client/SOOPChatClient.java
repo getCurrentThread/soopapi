@@ -29,7 +29,9 @@ import com.github.getcurrentthread.soopapi.util.SerialExecutor;
  *
  * <p>{@link SOOPChatConfig}에 {@code authCookie}가 설정되지 않은 경우, 클라이언트는 익명(읽기 전용) 모드로 연결됩니다. 익명 모드에서는
  * 채팅 메시지를 수신할 수 있지만, {@link #sendChat(String)}이나 {@link #sendWhisper(String, String)}을 호출하면 {@link
- * AuthenticationException}이 발생합니다.
+ * AuthenticationException}이 발생합니다. 19금 방송은 익명으로 들어갈 수 없어, 세션이 {@link
+ * com.github.getcurrentthread.soopapi.exception.AdultBroadcastException}을 원인으로 둔 {@link
+ * ConnectionException}으로 끝납니다.
  *
  * <h2>세션과 이벤트</h2>
  *

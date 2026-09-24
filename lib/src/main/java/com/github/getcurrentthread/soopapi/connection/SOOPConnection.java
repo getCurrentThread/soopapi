@@ -258,10 +258,14 @@ public final class SOOPConnection implements ChatConnection {
         return new ConnectionException("Connection closed");
     }
 
+    /** 원인의 메시지(19금 방송 안내 등)를 담아, 원인을 풀어 보지 않아도 실패 메시지와 DISCONNECTED 사유에서 이유가 보이게 한다. */
     private ConnectionException toConnectionException(Throwable error) {
         Throwable cause = SOOPChatUtils.unwrapCompletionException(error);
-        return cause instanceof ConnectionException ce
-                ? ce
-                : new ConnectionException("Cannot connect to channel: " + config.getBid(), cause);
+        if (cause instanceof ConnectionException ce) {
+            return ce;
+        }
+        String detail = cause.getMessage() != null ? cause.getMessage() : cause.toString();
+        return new ConnectionException(
+                "Cannot connect to channel " + config.getBid() + ": " + detail, cause);
     }
 }

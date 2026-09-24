@@ -1,6 +1,7 @@
 package com.github.getcurrentthread.soopapi.api;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import org.junit.jupiter.api.Test;
 
@@ -32,5 +33,20 @@ class JsonFieldsTest {
         assertEquals("d", JsonFields.getString(JSON, "n", "d"));
         assertEquals(-1, JsonFields.getInt(JSON, "n", -1));
         assertEquals(-1L, JsonFields.getLong(JSON, "n", -1L));
+    }
+
+    @Test
+    void parseObject_readsAnObject() {
+        assertEquals("v", JsonFields.getString(JsonFields.parseObject("{\"s\":\"v\"}"), "s", "d"));
+    }
+
+    @Test
+    void parseObject_failsWithoutEchoingANonObjectBody() {
+        for (String body : new String[] {"[\"secret1\"]", "\"secret1\"", "secret1", ""}) {
+            IllegalStateException e =
+                    assertThrows(IllegalStateException.class, () -> JsonFields.parseObject(body));
+
+            assertEquals("Response is not a JSON object", e.getMessage());
+        }
     }
 }

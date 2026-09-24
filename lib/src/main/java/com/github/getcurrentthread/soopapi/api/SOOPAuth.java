@@ -14,7 +14,6 @@ import com.github.getcurrentthread.soopapi.api.model.AuthCookie;
 import com.github.getcurrentthread.soopapi.exception.AuthenticationException;
 import com.github.getcurrentthread.soopapi.exception.SOOPChatException;
 import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
 
 public class SOOPAuth {
     private static final Logger LOGGER = Logger.getLogger(SOOPAuth.class.getName());
@@ -44,8 +43,7 @@ public class SOOPAuth {
                             }
 
                             try {
-                                JsonObject json =
-                                        JsonParser.parseString(response.body()).getAsJsonObject();
+                                JsonObject json = JsonFields.parseObject(response.body());
                                 int result = JsonFields.getInt(json, "RESULT", 0);
 
                                 Map<String, String> cookies =
@@ -89,7 +87,11 @@ public class SOOPAuth {
                     cookies.put(cookie.getName(), cookie.getValue());
                 }
             } catch (Exception e) {
-                LOGGER.log(Level.FINE, "Failed to parse cookie: " + header, e);
+                // 헤더에는 AuthTicket 같은 자격 증명 값이 들어 있으므로 헤더도, 그 내용이 실릴 수 있는 예외도 로그에 남기지 않는다.
+                LOGGER.fine(
+                        () ->
+                                "Skipping a Set-Cookie header that cannot be parsed: "
+                                        + e.getClass().getName());
             }
         }
         return cookies;
