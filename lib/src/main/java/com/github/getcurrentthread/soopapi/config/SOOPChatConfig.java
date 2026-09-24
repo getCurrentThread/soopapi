@@ -114,8 +114,12 @@ public class SOOPChatConfig {
     /**
      * 초기 패킷 전송 후 대기 시간(밀리초)을 반환합니다.
      *
+     * <p>이 값은 연결 동작에 아무런 영향을 주지 않습니다. CONNECT 패킷과 JOIN 패킷은 대기 없이 연달아 전송됩니다.
+     *
      * @return 초기 패킷 대기 시간(밀리초)
+     * @deprecated 효과가 없는 설정이며 향후 버전에서 제거될 예정입니다. CONNECT와 JOIN은 대기 없이 연달아 전송됩니다.
      */
+    @Deprecated(forRemoval = true)
     public long getInitialPacketDelayMs() {
         return initialPacketDelayMs;
     }
@@ -167,12 +171,16 @@ public class SOOPChatConfig {
         /**
          * 연결 타임아웃을 설정합니다.
          *
-         * @param connectionTimeout 연결 타임아웃
+         * @param connectionTimeout 연결 타임아웃 (0보다 커야 함)
          * @return 빌더 인스턴스
+         * @throws IllegalArgumentException {@code connectionTimeout}이 null이거나 0 이하인 경우
          */
         public Builder connectionTimeout(Duration connectionTimeout) {
             if (connectionTimeout == null) {
                 throw new IllegalArgumentException("connectionTimeout must not be null");
+            }
+            if (connectionTimeout.isNegative() || connectionTimeout.isZero()) {
+                throw new IllegalArgumentException("connectionTimeout must be positive");
             }
             this.connectionTimeout = connectionTimeout;
             return this;
@@ -214,9 +222,14 @@ public class SOOPChatConfig {
         /**
          * 초기 패킷 전송 후 대기 시간(밀리초)을 설정합니다.
          *
+         * <p>이 값은 연결 동작에 아무런 영향을 주지 않습니다. CONNECT 패킷과 JOIN 패킷은 대기 없이 연달아 전송됩니다. 기존 코드와의 호환을 위해 음수
+         * 값은 여전히 {@link #build()}에서 거부됩니다.
+         *
          * @param initialPacketDelayMs 대기 시간(밀리초), 기본값 1000
          * @return 빌더 인스턴스
+         * @deprecated 효과가 없는 설정이며 향후 버전에서 제거될 예정입니다. CONNECT와 JOIN은 대기 없이 연달아 전송됩니다.
          */
+        @Deprecated(forRemoval = true)
         public Builder initialPacketDelayMs(long initialPacketDelayMs) {
             this.initialPacketDelayMs = initialPacketDelayMs;
             return this;
@@ -231,8 +244,8 @@ public class SOOPChatConfig {
             if (bid == null || bid.isBlank()) {
                 throw new IllegalArgumentException("bid must not be null or blank");
             }
-            if (connectionTimeout != null && connectionTimeout.isNegative()) {
-                throw new IllegalArgumentException("connectionTimeout must not be negative");
+            if (connectionTimeout.isNegative() || connectionTimeout.isZero()) {
+                throw new IllegalArgumentException("connectionTimeout must be positive");
             }
             if (maxRetryAttempts < 0) {
                 throw new IllegalArgumentException("maxRetryAttempts must be >= 0");

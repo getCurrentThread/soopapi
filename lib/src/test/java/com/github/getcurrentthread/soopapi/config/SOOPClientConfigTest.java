@@ -24,16 +24,37 @@ class SOOPClientConfigTest {
 
     @Test
     void negativeConnectionTimeout_throws() {
-        SOOPClientConfig.Builder builder =
-                new SOOPClientConfig.Builder().connectionTimeout(Duration.ofSeconds(-1));
-        assertThrows(IllegalArgumentException.class, builder::build);
+        IllegalArgumentException e =
+                assertThrows(
+                        IllegalArgumentException.class,
+                        () ->
+                                new SOOPClientConfig.Builder()
+                                        .connectionTimeout(Duration.ofSeconds(-1))
+                                        .build());
+        assertEquals("connectionTimeout must be positive", e.getMessage());
     }
 
     @Test
-    void zeroConnectionTimeout_isValid() {
+    void zeroConnectionTimeout_throws() {
+        IllegalArgumentException e =
+                assertThrows(
+                        IllegalArgumentException.class,
+                        () -> new SOOPClientConfig.Builder().connectionTimeout(Duration.ZERO));
+        assertEquals("connectionTimeout must be positive", e.getMessage());
+    }
+
+    @Test
+    void nullConnectionTimeout_throws() {
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> new SOOPClientConfig.Builder().connectionTimeout(null));
+    }
+
+    @Test
+    void smallestPositiveConnectionTimeout_isValid() {
         SOOPClientConfig config =
-                new SOOPClientConfig.Builder().connectionTimeout(Duration.ZERO).build();
-        assertEquals(Duration.ZERO, config.getConnectionTimeout());
+                new SOOPClientConfig.Builder().connectionTimeout(Duration.ofMillis(1)).build();
+        assertEquals(Duration.ofMillis(1), config.getConnectionTimeout());
     }
 
     @Test
