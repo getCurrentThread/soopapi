@@ -45,7 +45,7 @@ try (SOOPClient client = new SOOPClient()) {
 ```
 
 - authCookie 없이 연결하면 **익명(읽기 전용)** 모드 — 수신은 되지만 `sendChat()`은 `AuthenticationException`.
-- 인증/전송: `client.auth().signIn(id, pw)` → `AuthCookie` → `SOOPChatConfig.Builder().authCookie(cookie)` → `JOIN_CHANNEL`을 받은 뒤 `sendChat(...)`(예: `chat.once(ChatEvent.JOIN_CHANNEL, e -> chat.sendChat("hi"))`). null·공백 메시지와 `U+000C`·`U+001B`가 든 메시지는 `IllegalArgumentException`.
+- 인증/전송: `client.auth().signIn(id, pw)` → `AuthCookie` → `SOOPChatConfig.Builder().authCookie(cookie)` → `connectToChat()` 뒤 `ready()`가 완료되면 `sendChat(...)`(예: `chat.connectToChat(); chat.ready().thenRun(() -> chat.sendChat("hi"));`). 인증 연결의 ENTER_INFO는 `ready()` 완료 전에 송신 순서에 들어가므로 곧바로 보내도 그 뒤에 나갑니다. `JOIN_CHANNEL` 리스너에서 보내도 되지만 `JOIN_CHANNEL`은 재입장할 때마다 다시 발생합니다. null·공백 메시지와 `U+000C`·`U+001B`가 든 메시지는 `IllegalArgumentException`.
 
 → 직접 연결 · 인증+전송 · 연결 상태 이벤트 · 에러 핸들링 예제: [llms-full.txt § 빠른 시작](llms-full.txt#빠른-시작)
 
@@ -60,7 +60,7 @@ try (SOOPClient client = new SOOPClient()) {
 
 **SOOPChatClient** (단일 채팅 연결, `AutoCloseable`)
 - `on/once/off(ChatEvent, listener)` · `getEventEmitter()`
-- `connectToChat()` (세션이 끝날 때 완료) · `connectAndAwait()` (블로킹) · `disconnect()` (non-blocking) · `close()` (최종 종료) · `reconnect()` · `forceReconnect()`
+- `connectToChat()` (세션이 끝날 때 완료) · `connectAndAwait()` (블로킹) · `ready()` (채널에 들어가면 완료) · `disconnect()` (non-blocking) · `close()` (최종 종료) · `reconnect()` · `forceReconnect()`
 - `sendChat(message)` · `sendWhisper(targetId, message)` (인증 필요) · `isConnected()` · `getConnectionStatus()` · `getBid()`
 
 **HTTP API**: `SOOPAuth.signIn(id, pw)` → `AuthCookie` · `SOOPLive.detail(id[, bno[, cookie]])` → `LiveDetail` · `SOOPChannel.station(id)` → `StationInfo`
@@ -83,7 +83,9 @@ BaseEvent (sealed)
 ```
 
 - 서비스 코드 `0`~`128`의 서버 이벤트 92개 + 클라이언트 합성 이벤트 5개(`-2` RAW, `-3` DISCONNECTED, `-4` RECONNECTING, `-5` RECONNECTED, `-1` NONE_TYPE).
-- `ChatEvent.fromCode(int)`는 미지의 코드에 대해 `NONE_TYPE`(센티넬)을 반환하고, 그런 패킷은 `NoneTypeEvent`로 전달됩니다(원래 코드는 `raw()` 헤더에 있음).
+- `ChatEvent.fromCode(int)`는 미지의 코드에 대해 `NONE_TYPE`(센티넬)을 반환하고, 그런 패킷은 `NONE_TYPE` 리스너에 `UnknownEvent`로 전달됩니다(`code()` = 원래 서비스 코드, `originalMessage()`·`raw()` = 패킷 전체). `UnknownEvent`는 `SystemBaseEvent`가 아니라 `BaseEvent`를 직접 구현하므로 `UnknownEvent`나 `BaseEvent`로 받습니다.
+- 목록·맵 필드(`BanWordEvent.banWordList`(`List<String>`), `ChatUserEvent.userList`, `AdminChatUserEvent.users`, `KickUserListEvent.kickedUsers`, `ChuserExtendEvent.userStatus`)는 수정할 수 없는 복사본입니다(`null` → 빈 목록·맵).
+- v0.14.0에서 올라오면: `banWordList`가 `String[]`에서 `List<String>`으로, `NoneTypeEvent`·`NoneTypeDecoder` 제거 → [llms-full.txt § 변경 사항 (호환성)](llms-full.txt#변경-사항-호환성)
 - 자주 쓰는 이벤트:
 
 | 코드 | ChatEvent | Record | 설명 |
@@ -98,7 +100,7 @@ BaseEvent (sealed)
 
 → 전체 코드↔이벤트 표(범주별): [llms-full.txt § 전체 이벤트 목록](llms-full.txt#전체-이벤트-목록)
 → 이벤트별 record 필드 상세: [llms-full.txt § 이벤트 Record 필드 상세](llms-full.txt#이벤트-record-필드-상세)
-→ 실제 캡처 패킷의 필드 값 예시(30개): [llms-full.txt § Fixture 검증 데이터](llms-full.txt#fixture-검증-데이터-30개-이벤트-실제-캡처)
+→ 합성 패킷으로 검증한 필드 값 예시(30개): [llms-full.txt § Fixture 검증 데이터](llms-full.txt#fixture-검증-데이터-30개-이벤트-합성-패킷)
 
 ## 코드표 (지연 디코딩)
 
@@ -116,9 +118,10 @@ BaseEvent (sealed)
 - `SOOPClient.add()`는 등록과 동시에 비동기 연결을 시작하므로 별도 `connectToChat()`이 불필요합니다. 저수준 `SOOPChatClient`를 직접 쓸 때만 `connectToChat()`/`connectAndAwait()`를 사용합니다.
 - `connectToChat()`은 세션을 시작하고, 반환된 future는 세션이 **끝날 때** 완료됩니다: `disconnect()`·서버 종료면 정상, 연결 실패·재시도 소진이면 `ConnectionException`. 진행 중이면 같은 future를 돌려줍니다.
 - 서버가 연결을 닫으면 세션 종료(자동 재연결 없음). 네트워크 오류·1006·송신/핑 실패·채널 입장 응답 없음은 backoff(2초→최대 30초) 자동 재연결(`RECONNECTING`→`RECONNECTED`), 소진 시 `DISCONNECTED(causedByError=true)`.
-- "연결됨"(`isConnected()`, `RECONNECTED`)은 서버가 채널 입장(JOIN)에 응답한 시점. 서버가 직후 재입장을 몇 초 무시할 수 있어 응답이 올 때까지 JOIN을 1초마다 다시 보냅니다.
+- "연결됨"(`isConnected()`, `ready()`, `RECONNECTED`)은 서버가 채널 입장(JOIN)에 응답한 시점. 서버가 직후 재입장을 몇 초 무시할 수 있어 응답이 올 때까지 JOIN을 1초마다 다시 보냅니다.
+- `ready()`: 이미 입장해 있으면 완료된 future, 연결 중·backoff 대기 중이면 다음 JOIN 응답에서 완료(`reconnect()`·`forceReconnect()`를 거쳐도 계속 대기). 그 전에 세션이 끝나면(disconnect·close·서버 종료·연결 실패·재시도 소진) `ConnectionException`, 세션이 없거나 `close()` 뒤면 `IllegalStateException`. 폴링하지 말고 받은 future 하나를 재사용합니다.
 - `forceReconnect()`/`SOOPClient.reconnect(id)`는 세션을 유지하며 `RECONNECTING`→`RECONNECTED`만 emit(`DISCONNECTED` 없음. 새 연결이 실패하면 세션 종료). `disconnect()`는 어떤 상태에서도 세션을 끝내며 non-blocking, `close()`는 최종 종료.
-- 이벤트는 스트림마다 도착 순서대로 한 번에 하나씩 전달, `DISCONNECTED`는 세션마다 정확히 한 번(직접 끝낸 경우 `isClientInitiated()`). 리스너 안에서 세션 future를 기다리면 교착(송신 결과는 기다려도 됨).
+- 이벤트는 스트림마다 도착 순서대로 한 번에 하나씩 전달, `DISCONNECTED`는 세션마다 정확히 한 번(직접 끝낸 경우 `isClientInitiated()`). 리스너 안에서 세션 future를 기다리면 교착(송신 결과·`reconnect()`·`ready()`는 lane 밖에서 완료되므로 기다려도 됨. 기다리는 동안 그 스트림의 이벤트 전달은 멈춤).
 - 예외 계층: `SOOPChatException`(RuntimeException) ← `AuthenticationException` · `ConnectionException` · `EventEmitterException`(`getChatEvent()` 제공).
 
 → 상세: [llms-full.txt § connectToChat() 동작 방식](llms-full.txt#connecttochat-동작-방식) · [§ 에러 처리](llms-full.txt#에러-처리)

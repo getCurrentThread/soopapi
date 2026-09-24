@@ -15,7 +15,7 @@
 - **스트림별 순서 보장**: 이벤트는 스트림마다 도착 순서대로 한 번에 하나씩 전달(공유 가상 스레드 풀 위의 직렬 실행)
 - **통합 API 클라이언트**: `SOOPClient` 파사드로 인증, 방송 정보, 채널 정보, 채팅을 통합 관리
 - **다중 채팅 연결**: bid 기준 dedup된 `add`/`remove`/`get` API와 `(streamerId, event)`를 함께 받는 글로벌 이벤트 리스너 지원
-- **채팅 전송 지원**: `sendChat()` / `sendWhisper()` 메서드로 채팅·귓말 전송
+- **채팅 전송 지원**: `sendChat()` / `sendWhisper()` 메서드로 채팅·귓말 전송, `ready()`로 채널 입장을 기다린 뒤 전송
 - **익명(읽기 전용) 연결**: 인증 없이 채팅 수신 가능
 - 네트워크 장애 시 backoff 자동 재연결(서버가 연결을 닫으면 세션 종료)
 - 이벤트 리스너 에러 핸들링
@@ -212,21 +212,24 @@ chat.on(ChatEvent.CHAT_MESSAGE, (ChatMessageEvent e) -> {
     System.out.println(e.senderNickname() + ": " + e.message());
 });
 
-// 3. 채널에 입장한 뒤(JOIN_CHANNEL)에 전송합니다
-chat.once(ChatEvent.JOIN_CHANNEL, (JoinChannelEvent e) -> {
+// 3. 연결 시작. 반환된 future는 세션이 끝날 때 완료되므로 여기서 기다리지 않습니다
+chat.connectToChat();
+
+// 4. 채널에 입장하면(ready) 전송합니다
+chat.ready().thenRun(() -> {
     chat.sendChat("Hello!")
             .exceptionally(ex -> { System.err.println("전송 실패: " + ex); return null; });
 
     // 특정 사용자에게 귓말 전송 ("targetUser" = 받는 사람 로그인 ID, 닉네임/(n) 형태 아님)
     chat.sendWhisper("targetUser", "안녕하세요");
-});
-
-// 4. 연결 시작. 반환된 future는 세션이 끝날 때 완료되므로 여기서 기다리지 않습니다
-chat.connectToChat();
+}).exceptionally(ex -> { System.err.println("채널 입장 전에 세션이 끝남: " + ex); return null; });
 ```
 
+- `ready()`는 `connectToChat()` 뒤에 부릅니다. 세션이 없으면 `IllegalStateException`으로 실패합니다. 완료 콜백은 대개 수신 스레드에서 실행되므로 오래 걸리는 작업은 `thenRunAsync`로 넘깁니다.
+- 인증 연결의 입장 정보(ENTER_INFO)는 `ready()`가 완료되기 전에 송신 순서에 들어가므로, 완료되자마자 보낸 메시지도 그 뒤에 나갑니다.
+- `JOIN_CHANNEL` 리스너에서 보내도 됩니다. 다만 `JOIN_CHANNEL`은 재연결로 채널에 다시 들어갈 때마다 다시 발생하므로, 한 번만 보내려면 `once()`를 씁니다.
 - 메시지가 `null`·공백이거나 제어 문자 `U+000C`·`U+001B`를 포함하면 `IllegalArgumentException`으로 실패합니다.
-- 리스너 안에서 `sendChat(..).join()`처럼 **송신 결과**를 기다리는 것은 안전합니다. 하지만 **세션 future**(`connectToChat()`, `connectAndAwait()`, `forceReconnect()`)를 기다리면 이벤트 전달이 멈춰 교착 상태가 됩니다.
+- 리스너 안에서 `sendChat(..).join()`이나 `ready().join()`처럼 기다리는 것은 안전합니다. 하지만 **세션 future**(`connectToChat()`, `connectAndAwait()`, `forceReconnect()`)를 기다리면 이벤트 전달이 멈춰 교착 상태가 됩니다.
 
 ### 연결 상태 이벤트
 
@@ -298,7 +301,7 @@ SOOPChatConfig config = new SOOPChatConfig.Builder()
 
 `SOOPClient.add()`는 등록과 동시에 비동기 연결을 시작하므로 일반적으로 사용자가 직접 연결 메서드를 호출할 필요가 없습니다. 저수준 `SOOPChatClient`를 직접 사용하는 경우에만 아래 메서드를 사용합니다.
 
-`connectToChat()`은 **세션**을 시작합니다. 반환된 `CompletableFuture`는 세션이 **끝날 때** 완료됩니다. `disconnect()`나 서버의 연결 종료로 끝나면 정상 완료, 연결 실패나 재시도 소진으로 끝나면 `ConnectionException`으로 예외 완료됩니다. 연결됐는지는 `JOIN_CHANNEL` 이벤트나 `isConnected()`로 확인하세요.
+`connectToChat()`은 **세션**을 시작합니다. 반환된 `CompletableFuture`는 세션이 **끝날 때** 완료됩니다. `disconnect()`나 서버의 연결 종료로 끝나면 정상 완료, 연결 실패나 재시도 소진으로 끝나면 `ConnectionException`으로 예외 완료됩니다. 채널에 들어간 시점은 `ready()`로 기다리거나 `JOIN_CHANNEL` 이벤트·`isConnected()`로 확인하세요.
 
 | 메서드 | 동작 |
 |--------|------|
@@ -310,8 +313,9 @@ SOOPChatConfig config = new SOOPChatConfig.Builder()
 | `SOOPClient.close()` | 모든 클라이언트 종료 + HTTP 리소스 해제. `try-with-resources` 권장. |
 | `SOOPChatClient.connectToChat()` | (저수준) 세션 시작. 진행 중인 세션이 있으면 같은 future 반환. |
 | `SOOPChatClient.connectAndAwait()` | (저수준) `connectToChat().join()`의 편의 메서드 (블로킹). |
+| `SOOPChatClient.ready()` | 현재 세션이 채널에 들어가면(서버가 JOIN에 응답하면) 완료되는 future. 이미 들어가 있으면 완료된 future, 연결 중·backoff 대기 중이면 다음 JOIN 응답에서 완료되며 `reconnect()`·`forceReconnect()`를 거쳐도 실패하지 않고 새 연결을 기다림. 그 전에 세션이 끝나면(`disconnect()`·`close()`·서버 종료·연결 실패·재시도 소진) `ConnectionException`, 세션이 없거나 `close()` 뒤면 `IllegalStateException`으로 실패. |
 | `SOOPChatClient.disconnect()` | (저수준) 연결 중·재연결 대기 중을 포함해 어떤 상태에서도 세션 종료. 블로킹하지 않으며 `DISCONNECTED`는 비동기로 전달. 이후 새 세션 시작 가능. |
-| `SOOPChatClient.close()` | (저수준) 세션 종료 후 클라이언트를 닫음. 이후 `connectToChat()`·`forceReconnect()`는 실패. |
+| `SOOPChatClient.close()` | (저수준) 세션 종료 후 클라이언트를 닫음. 이후 `connectToChat()`·`forceReconnect()`·`ready()`는 실패. |
 | `SOOPChatClient.reconnect()` | (저수준) 방송 정보 재조회 없이 WebSocket만 다시 엶. 새 소켓이 채널에 입장하면 완료. 세션이 없으면 실패. |
 | `SOOPChatClient.forceReconnect()` | (저수준) 방송 정보 조회부터 새 연결. 세션 유지, `RECONNECTING(1/1)`→`RECONNECTED` emit, `DISCONNECTED` 없음(새 연결이 실패하면 세션 종료). 세션이 없으면 새로 시작. |
 
@@ -319,13 +323,15 @@ SOOPChatConfig config = new SOOPChatConfig.Builder()
 
 - **서버가 연결을 닫으면**(Close 프레임) 세션이 끝납니다. `DISCONNECTED`(`causedByError=false`)가 발생하며 자동으로 다시 연결하지 않습니다.
 - **네트워크 오류·비정상 종료(1006)·송신/핑 실패·채널 입장 응답 없음**이면 backoff(2초부터 두 배씩, 최대 30초)로 자동 재연결하며 `RECONNECTING`→`RECONNECTED`가 발생합니다. `maxRetryAttempts`를 다 쓰면 `DISCONNECTED`(`causedByError=true`)와 함께 세션 future가 예외로 완료됩니다.
-- **연결됨**(`isConnected()`, `RECONNECTED`)은 서버가 채널 입장(JOIN)에 응답한 시점입니다. 서버는 같은 클라이언트가 방금 나간 채널에 곧바로 다시 들어오는 요청을 몇 초간 무시할 수 있어, 응답이 올 때까지 입장 요청을 1초마다 다시 보냅니다. 그래서 `forceReconnect()` 직후 재입장까지 1~3초가 걸릴 수 있습니다.
+- **연결됨**(`isConnected()`, `ready()`, `RECONNECTED`)은 서버가 채널 입장(JOIN)에 응답한 시점입니다. 서버는 같은 클라이언트가 방금 나간 채널에 곧바로 다시 들어오는 요청을 몇 초간 무시할 수 있어, 응답이 올 때까지 입장 요청을 1초마다 다시 보냅니다. 그래서 `forceReconnect()` 직후 재입장까지 1~3초가 걸릴 수 있습니다.
+- 재연결을 기다리는 동안 부른 `ready()`는 다음 입장에서 완료되고, 세션이 끝날 때만 실패합니다. 제한 시간을 두고 반복해서 부르기보다 받은 future 하나를 재사용하세요.
 
 ### 이벤트 전달 규칙
 
 - 이벤트는 스트림마다 **도착 순서대로 한 번에 하나씩** 전달됩니다. 리스너가 느리면 그 스트림의 이벤트만 늦어집니다.
 - `DISCONNECTED`는 세션마다 **정확히 한 번** 발생하고, 그 뒤로는 해당 세션의 이벤트가 오지 않습니다. 직접 끝낸 경우는 `isClientInitiated()`로 구분합니다.
-- 리스너 안에서 세션 future(`connectToChat()`, `connectAndAwait()`, `forceReconnect()`)를 기다리면 교착 상태가 됩니다. 송신 결과(`sendChat(..).join()`)나 `reconnect().join()`은 기다려도 됩니다.
+- 리스너 안에서 세션 future(`connectToChat()`, `connectAndAwait()`, `forceReconnect()`)를 기다리면 교착 상태가 됩니다. 송신 결과(`sendChat(..).join()`), `reconnect().join()`, `ready().join()`은 기다려도 됩니다. `ready()`는 이벤트 전달 순서를 거치지 않고 대개 수신 스레드에서 `JOIN_CHANNEL` 리스너보다 먼저 완료되기 때문입니다. 다만 기다리는 동안 그 스트림의 이벤트 전달은 멈춥니다.
+- `JOIN_CHANNEL`은 재연결로 채널에 다시 들어갈 때마다 다시 발생합니다.
 
 ## 이벤트 타입
 
@@ -333,7 +339,7 @@ SOOPChatConfig config = new SOOPChatConfig.Builder()
 
 ### 지원 이벤트 목록
 
-아래 이벤트는 실제 수집된 패킷으로 디코딩이 검증되었습니다.
+아래 30개 이벤트는 서버 형식을 그대로 따르는 합성 패킷으로 모든 필드의 디코딩을 테스트합니다.
 
 | 이벤트 | 코드 | Record 타입 | 주요 필드 |
 |--------|------|-------------|-----------|
@@ -350,7 +356,7 @@ SOOPChatConfig config = new SOOPChatConfig.Builder()
 | `ICE_MODE` | 19 | `IceModeEvent` | `iceMode` (1=활성화) |
 | `ICE_MODE_EX` | 21 | `IceModeExEvent` | `iceMode`, `freezeType`, `balloonLimitCount`, `subscriptionLimitCount` |
 | `BJ_STICKER_ITEM` | 36 | `BjStickerItemEvent` | `type` |
-| `BAN_WORD` | 54 | `BanWordEvent` | `replaceWord` (대체어), `banWordList` (금지어 배열) |
+| `BAN_WORD` | 54 | `BanWordEvent` | `replaceWord` (대체어), `banWordList` (금지어 목록, `List<String>`) |
 | `ADCON_EFFECT` | 87 | `AdconEffectEvent` | `bjId`, `senderId`, `senderNickname`, `adconCount`, `message`, `message2`, `urlImg`, `urlDefault` |
 | `KICK_MSG_STATE` | 90 | `KickMsgStateEvent` | `chatNo`, `isHideKickMessage` |
 | `FOLLOW_ITEM` | 91 | `FollowItemEvent` | `chatNo`, `recvId`, `sendId`, `sendNick`, `type` (신규 구독) |
@@ -376,7 +382,23 @@ SOOPChatConfig config = new SOOPChatConfig.Builder()
 | `RECONNECTING` | -4 | `ReconnectingEvent` | `attemptNumber`, `maxAttempts`, `delayMs` |
 | `RECONNECTED` | -5 | `ReconnectedEvent` | `totalAttempts` |
 
-전체 이벤트(서버 이벤트 92개 + 클라이언트 이벤트 `RAW`·`DISCONNECTED`·`RECONNECTING`·`RECONNECTED`·`NONE_TYPE`)는 `ChatEvent.java`를, 모든 Record 필드 상세는 `llms-full.txt`를 참조하세요. 알 수 없는 서비스 코드는 `NONE_TYPE`(`NoneTypeEvent`)으로 전달되며, 원래 코드는 `raw()`의 헤더에 남아 있습니다.
+전체 이벤트(서버 이벤트 92개 + 클라이언트 이벤트 `RAW`·`DISCONNECTED`·`RECONNECTING`·`RECONNECTED`·`NONE_TYPE`)는 `ChatEvent.java`를, 모든 Record 필드 상세는 `llms-full.txt`를 참조하세요. 알 수 없는 서비스 코드의 패킷은 `NONE_TYPE` 리스너에 `UnknownEvent`로 전달되며, 원래 코드는 `code()`, 패킷 전체는 `raw()`(`originalMessage()`와 같음)로 확인합니다.
+
+### 변경 사항 (호환성)
+
+v0.14.0에서 올리는 경우 아래 변경을 확인하세요.
+
+- `BanWordEvent.banWordList()`는 `String[]` 대신 `List<String>`을 반환합니다. 빈 토큰을 버리고 공백을 trim하지 않는 규칙은 같습니다.
+- 이벤트의 목록·맵 필드는 수정할 수 없는 복사본입니다: `BanWordEvent.banWordList`, `ChatUserEvent.userList`, `AdminChatUserEvent.users`, `KickUserListEvent.kickedUsers`, `ChuserExtendEvent.userStatus`(바깥 맵과 안쪽 맵 모두). 수정하면 `UnsupportedOperationException`이 발생합니다. 생성자는 `null`을 빈 목록·맵으로 바꾸고 `null` 요소는 받지 않습니다. 같은 이벤트 객체가 모든 리스너에 전달되므로, 고쳐 쓰려면 `new ArrayList<>(e.userList())`처럼 복사합니다.
+- 알 수 없는 서비스 코드는 `NONE_TYPE`에 `UnknownEvent`(`code()` = 원래 서비스 코드)로 전달됩니다. `NoneTypeEvent`와 `NoneTypeDecoder`는 제거되었습니다.
+- `UnknownEvent`는 `SystemBaseEvent`가 아니라 `BaseEvent`를 직접 구현합니다. `NONE_TYPE` 리스너를 `SystemBaseEvent`로 받고 있었다면 `UnknownEvent`나 `BaseEvent`로 바꿉니다.
+- 새 API: `SOOPChatClient.ready()` ([연결 라이프사이클](#연결-라이프사이클) 참조).
+
+```java
+chat.on(ChatEvent.NONE_TYPE, (UnknownEvent e) -> {
+    System.out.println("알 수 없는 코드 " + e.code() + ": " + e.raw());
+});
+```
 
 ## 코드표 (Code Tables)
 
