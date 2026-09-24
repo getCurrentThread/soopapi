@@ -134,6 +134,10 @@ public enum ChatEvent {
     RECONNECTED(-5, "Reconnected"),
 
     // ── 알 수 없는 타입 ──
+    /**
+     * 모르는 서비스 코드의 센티넬. 이런 패킷은 원래 코드를 담은 {@link
+     * com.github.getcurrentthread.soopapi.event.model.UnknownEvent}로 전달됩니다.
+     */
     NONE_TYPE(-1, "Unknown Type");
 
     private static final Map<Integer, ChatEvent> CODE_MAP;
@@ -154,6 +158,7 @@ public enum ChatEvent {
         this.description = description;
     }
 
+    /** 서비스 코드에 해당하는 이벤트를 반환합니다. 모르는 코드면 {@link #NONE_TYPE}을 반환합니다. */
     public static ChatEvent fromCode(int code) {
         return CODE_MAP.getOrDefault(code, NONE_TYPE);
     }

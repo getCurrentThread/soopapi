@@ -622,10 +622,7 @@ class SOOPChatClientRealConnectionTest {
             }
             case BanWordEvent e -> {
                 results.add(checkNonNullString("replaceWord", e.replaceWord()));
-                results.add(checkNonNull("banWordList", e.banWordList()));
-                if (e.banWordList() != null) {
-                    results.add(checkPositive("banWordList.length", e.banWordList().length));
-                }
+                results.add(checkNonNullCollection("banWordList", e.banWordList()));
             }
             case BjNoticeEvent e -> {
                 results.add(checkAny("show", e.show()));
@@ -640,11 +637,9 @@ class SOOPChatClientRealConnectionTest {
             case EmoticonTicketEvent e -> {
                 results.add(checkAny("value", e.value()));
             }
-            case NoneTypeEvent e -> {
-                results.add(checkAny("value", e.value()));
-            }
             case UnknownEvent e -> {
-                results.add(checkAny("code", e.code()));
+                // 원래 서비스 코드가 실려야 한다. 모르는 코드는 모두 양수다(0은 KEEP_ALIVE).
+                results.add(checkPositive("code", e.code()));
                 results.add(checkNonNullString("originalMessage", e.originalMessage()));
             }
             default -> {

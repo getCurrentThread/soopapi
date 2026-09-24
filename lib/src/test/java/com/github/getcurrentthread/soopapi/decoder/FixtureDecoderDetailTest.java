@@ -9,7 +9,6 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
@@ -173,8 +172,8 @@ class FixtureDecoderDetailTest {
         assertNotNull(e, "BAN_WORD 이벤트 디코딩 실패");
 
         printField("BAN_WORD", "replaceWord", e.replaceWord());
-        printField("BAN_WORD", "banWordList.length", e.banWordList().length);
-        printField("BAN_WORD", "banWordList", Arrays.toString(e.banWordList()));
+        printField("BAN_WORD", "banWordList.size", e.banWordList().size());
+        printField("BAN_WORD", "banWordList", e.banWordList());
         printField("BAN_WORD", "eventType", e.eventType());
 
         assertEquals(ChatEvent.BAN_WORD, e.eventType());

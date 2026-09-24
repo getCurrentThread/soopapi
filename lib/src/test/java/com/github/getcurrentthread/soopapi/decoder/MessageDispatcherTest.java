@@ -124,7 +124,33 @@ class MessageDispatcherTest {
 
         dispatcher.dispatchMessage(message);
 
-        assertNotNull(received.get(), "Unknown event should be dispatched");
+        UnknownEvent event = received.get();
+        assertNotNull(event, "Unknown event should be dispatched");
+        assertEquals(9999, event.code(), "Original service code from the header");
+        assertEquals(ChatEvent.NONE_TYPE, event.eventType());
+        assertEquals(message, event.originalMessage());
+        assertEquals(message, event.raw());
+    }
+
+    @Test
+    void knownCodeWithoutDecoder_isDeliveredOnNoneTypeOnly() {
+        dispatcher = createDispatcher(Map.of());
+
+        AtomicInteger chatDelivered = new AtomicInteger();
+        emitter.on(ChatEvent.CHAT_MESSAGE, e -> chatDelivered.incrementAndGet());
+        AtomicReference<UnknownEvent> received = new AtomicReference<>();
+        emitter.on(ChatEvent.NONE_TYPE, (UnknownEvent e) -> received.set(e));
+
+        // CHAT_MESSAGE(5)는 알려진 코드지만 디코더 맵에 없다
+        String message = SOOPConstants.ESC + "0005" + "000010" + "00" + SOOPConstants.F + "data";
+        dispatcher.dispatchMessage(message);
+
+        assertEquals(0, chatDelivered.get(), "UnknownEvent must not reach CHAT_MESSAGE listeners");
+        UnknownEvent event = received.get();
+        assertNotNull(event, "Packet without a decoder should arrive on NONE_TYPE");
+        assertEquals(5, event.code());
+        assertEquals(ChatEvent.NONE_TYPE, event.eventType());
+        assertEquals(message, event.raw());
     }
 
     @Test

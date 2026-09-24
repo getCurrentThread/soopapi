@@ -83,7 +83,11 @@ public class MessageDispatcher {
                 LOGGER.fine(() -> "Dropping packet with malformed header: " + truncate(message));
                 return;
             }
-            ChatEvent chatEvent = ChatEvent.fromCode(serviceCode);
+            ChatEvent known = ChatEvent.fromCode(serviceCode);
+            IMessageDecoder decoder = messageDecoders.get(known);
+            // 디코더가 없는 코드는 모르는 코드와 똑같이 NONE_TYPE으로 보낸다.
+            // 알려진 이벤트의 타입 지정 리스너가 UnknownEvent를 받지 않게 한다.
+            ChatEvent chatEvent = decoder != null ? known : ChatEvent.NONE_TYPE;
 
             Consumer<JoinChannelEvent> hook =
                     chatEvent == ChatEvent.JOIN_CHANNEL ? joinChannelHook : null;
@@ -91,13 +95,11 @@ public class MessageDispatcher {
                 return;
             }
 
-            IMessageDecoder decoder = messageDecoders.get(chatEvent);
-            String[] messageParts = SOOPChatUtils.splitFields(message, firstSep + 1);
-
             BaseEvent event;
             if (decoder != null) {
-                event = decoder.decode(messageParts, message);
+                event = decoder.decode(SOOPChatUtils.splitFields(message, firstSep + 1), message);
             } else {
+                // NONE_TYPE으로 합쳐지므로 헤더에서 읽은 원래 코드를 함께 싣는다.
                 event =
                         new UnknownEvent(
                                 serviceCode,

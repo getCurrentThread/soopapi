@@ -5,6 +5,13 @@ import java.util.Map;
 import com.github.getcurrentthread.soopapi.decoder.message.*;
 import com.github.getcurrentthread.soopapi.event.ChatEvent;
 
+/**
+ * 서비스 코드가 있는 서버 이벤트마다 디코더를 등록한 기본 팩토리입니다.
+ *
+ * <p>{@link ChatEvent#NONE_TYPE}에는 디코더를 두지 않습니다. 모르는 서비스 코드의 패킷은 {@link
+ * com.github.getcurrentthread.soopapi.decoder.MessageDispatcher}가 원래 코드를 담은 {@link
+ * com.github.getcurrentthread.soopapi.event.model.UnknownEvent}로 전달합니다.
+ */
 public class DefaultMessageDecoderFactory implements MessageDecoderFactory {
     private static final Map<ChatEvent, IMessageDecoder> DECODERS =
             Map.<ChatEvent, IMessageDecoder>ofEntries(
@@ -90,7 +97,6 @@ public class DefaultMessageDecoderFactory implements MessageDecoderFactory {
                     Map.entry(ChatEvent.BJ_STICKER_ITEM, new BJStickerItemDecoder()),
                     Map.entry(ChatEvent.STATION_ADCON, new StationAdconDecoder()),
                     Map.entry(ChatEvent.EMOTICON_TICKET, new EmoticonTicketDecoder()),
-                    Map.entry(ChatEvent.NONE_TYPE, new NoneTypeDecoder()),
                     Map.entry(ChatEvent.TRANSLATION_STATE, new TranslationStateDecoder()),
                     Map.entry(ChatEvent.SET_DUMB, new SetDumbDecoder()),
                     Map.entry(ChatEvent.SET_BJ_STAT, new SetBjStatDecoder()),

@@ -210,7 +210,8 @@ public class EventEmitterTest {
                         "raw",
                         System.currentTimeMillis());
         UnknownEvent unknownEvent =
-                new UnknownEvent(-1, "raw", ChatEvent.NONE_TYPE, "raw", System.currentTimeMillis());
+                new UnknownEvent(
+                        9999, "raw", ChatEvent.NONE_TYPE, "raw", System.currentTimeMillis());
 
         emitter.emit(ChatEvent.CHAT_MESSAGE, chatEvent);
         emitter.emit(ChatEvent.NONE_TYPE, unknownEvent);

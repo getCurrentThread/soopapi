@@ -3,7 +3,9 @@ package com.github.getcurrentthread.soopapi.decoder.message;
 import static org.junit.jupiter.api.Assertions.*;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.logging.Handler;
 import java.util.logging.Level;
 import java.util.logging.LogRecord;
@@ -13,9 +15,13 @@ import org.junit.jupiter.api.Test;
 
 import com.github.getcurrentthread.soopapi.event.ChatEvent;
 import com.github.getcurrentthread.soopapi.event.model.AdInBroadJsonEvent;
+import com.github.getcurrentthread.soopapi.event.model.AdminChatUserEvent;
 import com.github.getcurrentthread.soopapi.event.model.BanWordEvent;
 import com.github.getcurrentthread.soopapi.event.model.BaseEvent;
 import com.github.getcurrentthread.soopapi.event.model.ChatMessageEvent;
+import com.github.getcurrentthread.soopapi.event.model.ChatUserEvent;
+import com.github.getcurrentthread.soopapi.event.model.ChuserExtendEvent;
+import com.github.getcurrentthread.soopapi.event.model.KickUserListEvent;
 import com.github.getcurrentthread.soopapi.event.model.MissionEvent;
 import com.github.getcurrentthread.soopapi.event.model.MissionSettleEvent;
 import com.github.getcurrentthread.soopapi.event.model.OGQEmoticonEvent;
@@ -303,7 +309,7 @@ class DecoderBoundsValidationTest {
                         BanWordEvent.class, decoder.decode(new String[] {"***", "", ""}, "raw"));
 
         assertEquals("***", event.replaceWord());
-        assertEquals(0, event.banWordList().length);
+        assertEquals(List.of(), event.banWordList());
     }
 
     @Test
@@ -313,7 +319,7 @@ class DecoderBoundsValidationTest {
         BanWordEvent event =
                 assertInstanceOf(BanWordEvent.class, decoder.decode(new String[] {"***"}, "raw"));
 
-        assertEquals(0, event.banWordList().length);
+        assertEquals(List.of(), event.banWordList());
     }
 
     @Test
@@ -325,7 +331,107 @@ class DecoderBoundsValidationTest {
                         BanWordEvent.class,
                         decoder.decode(new String[] {"***", "word1,,word2, word3,", ""}, "raw"));
 
-        assertArrayEquals(new String[] {"word1", "word2", " word3"}, event.banWordList());
+        assertEquals(List.of("word1", "word2", " word3"), event.banWordList());
+    }
+
+    @Test
+    void banWord_listIsUnmodifiable() {
+        BanWordDecoder decoder = new BanWordDecoder();
+
+        BanWordEvent event =
+                assertInstanceOf(
+                        BanWordEvent.class,
+                        decoder.decode(new String[] {"***", "word1,word2"}, "raw"));
+
+        assertThrows(UnsupportedOperationException.class, () -> event.banWordList().add("word3"));
+        assertThrows(UnsupportedOperationException.class, () -> event.banWordList().clear());
+    }
+
+    @Test
+    void banWord_constructorCopiesTheList() {
+        List<String> source = new ArrayList<>(List.of("word1"));
+
+        BanWordEvent event = new BanWordEvent("***", source, ChatEvent.BAN_WORD, "raw", 0);
+        source.add("word2");
+
+        assertEquals(List.of("word1"), event.banWordList(), "Later changes must not leak in");
+    }
+
+    // --- 목록 컴포넌트 (ChatUser / AdminChatUser / KickUserList / BanWord) ---
+
+    @Test
+    void listDecoders_returnUnmodifiableLists() {
+        ChatUserEvent chatUser =
+                assertInstanceOf(
+                        ChatUserEvent.class,
+                        new ChatUserDecoder()
+                                .decode(new String[] {"1", "user1", "닉네임1", "0"}, "raw"));
+        AdminChatUserEvent adminChatUser =
+                assertInstanceOf(
+                        AdminChatUserEvent.class,
+                        new AdminChatUserDecoder()
+                                .decode(new String[] {"1", "user1", "닉네임1", "0"}, "raw"));
+        KickUserListEvent kickUserList =
+                assertInstanceOf(
+                        KickUserListEvent.class,
+                        new KickUserListDecoder()
+                                .decode(
+                                        new String[] {"user1", "닉네임1", "1000", "bj1", "닉네임2", "0"},
+                                        "raw"));
+
+        assertEquals(1, chatUser.userList().size());
+        assertEquals(1, adminChatUser.users().size());
+        assertEquals(1, kickUserList.kickedUsers().size());
+        assertThrows(UnsupportedOperationException.class, () -> chatUser.userList().clear());
+        assertThrows(UnsupportedOperationException.class, () -> adminChatUser.users().clear());
+        assertThrows(UnsupportedOperationException.class, () -> kickUserList.kickedUsers().clear());
+    }
+
+    @Test
+    void listRecords_mapNullToEmptyList() {
+        assertEquals(
+                List.of(), new ChatUserEvent(0, null, ChatEvent.CHAT_USER, "raw", 0).userList());
+        assertEquals(
+                List.of(),
+                new AdminChatUserEvent("list", null, ChatEvent.ADMIN_CHAT_USER, "raw", 0).users());
+        assertEquals(
+                List.of(),
+                new KickUserListEvent(null, ChatEvent.KICK_USERLIST, "raw", 0).kickedUsers());
+        assertEquals(
+                List.of(),
+                new BanWordEvent("***", null, ChatEvent.BAN_WORD, "raw", 0).banWordList());
+    }
+
+    // --- ChuserExtendEvent (중첩 맵 컴포넌트) ---
+
+    @Test
+    void chuserExtend_mapsAreUnmodifiable() {
+        ChuserExtendEvent event =
+                assertInstanceOf(
+                        ChuserExtendEvent.class,
+                        new ChuserExtendDecoder()
+                                .decode(new String[] {"1000", "viewer1", "fw=1&afw=0"}, "raw"));
+
+        assertEquals(Map.of("viewer1", Map.of("fw", 1, "afw", 0)), event.userStatus());
+        assertThrows(UnsupportedOperationException.class, () -> event.userStatus().clear());
+        assertThrows(
+                UnsupportedOperationException.class,
+                () -> event.userStatus().get("viewer1").put("fw", 0));
+    }
+
+    @Test
+    void chuserExtend_constructorCopiesMapsAndMapsNullToEmpty() {
+        Map<String, Integer> inner = new HashMap<>(Map.of("fw", 1));
+        Map<String, Map<String, Integer>> outer = new HashMap<>(Map.of("viewer1", inner));
+
+        ChuserExtendEvent event = new ChuserExtendEvent(outer, ChatEvent.CHUSER_EXTEND, "raw", 0);
+        inner.put("afw", 1);
+        outer.put("viewer2", Map.of());
+
+        assertEquals(Map.of("viewer1", Map.of("fw", 1)), event.userStatus());
+        assertEquals(
+                Map.of(),
+                new ChuserExtendEvent(null, ChatEvent.CHUSER_EXTEND, "raw", 0).userStatus());
     }
 
     // --- ChatMessageDecoder (최소 요소 수=8, safeParseInt 교차 검증) ---

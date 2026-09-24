@@ -3,12 +3,15 @@ package com.github.getcurrentthread.soopapi.decoder.factory;
 import static org.junit.jupiter.api.Assertions.*;
 
 import java.util.Arrays;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.AbstractExecutorService;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import org.junit.jupiter.api.Test;
@@ -23,7 +26,7 @@ import com.github.getcurrentthread.soopapi.event.ChatEvent;
 import com.github.getcurrentthread.soopapi.event.EventEmitter;
 import com.github.getcurrentthread.soopapi.event.model.BaseEvent;
 import com.github.getcurrentthread.soopapi.event.model.ChocolateEvent;
-import com.github.getcurrentthread.soopapi.event.model.NoneTypeEvent;
+import com.github.getcurrentthread.soopapi.event.model.UnknownEvent;
 
 class DefaultMessageDecoderFactoryTest {
 
@@ -84,8 +87,21 @@ class DefaultMessageDecoderFactoryTest {
         assertEquals(3, subEvent.count());
     }
 
+    // 클라이언트 합성 이벤트(음수 코드)에 디코더가 있으면 안 된다. 특히 NONE_TYPE에 디코더가 있으면 원래 코드가 사라진다.
     @Test
-    void unknownServiceCode_isDeliveredOnNoneType() {
+    void registeredKeys_areExactlyTheServerEvents() {
+        Set<ChatEvent> serverEvents =
+                Arrays.stream(ChatEvent.values())
+                        .filter(e -> e.getCode() >= 0)
+                        .collect(Collectors.toCollection(() -> EnumSet.noneOf(ChatEvent.class)));
+
+        assertEquals(serverEvents, EnumSet.copyOf(DECODERS.keySet()));
+        assertEquals(92, DECODERS.size());
+        assertFalse(DECODERS.containsKey(ChatEvent.NONE_TYPE));
+    }
+
+    @Test
+    void unknownServiceCode_isDeliveredAsUnknownEventWithOriginalCode() {
         EventEmitter emitter = new EventEmitter();
         MessageDispatcher dispatcher = new MessageDispatcher(DECODERS, directExecutor(), emitter);
 
@@ -94,12 +110,14 @@ class DefaultMessageDecoderFactoryTest {
 
         // 헤더 형식: ESC + TAB + 서비스 코드(4) + 길이(6) + 접미사(2)
         String header = SOOPConstants.ESC + "9999" + "000010" + "00";
-        dispatcher.dispatchMessage(header + SOOPConstants.F + "7" + SOOPConstants.F);
+        String message = header + SOOPConstants.F + "7" + SOOPConstants.F;
+        dispatcher.dispatchMessage(message);
 
-        // 기본 팩토리는 NONE_TYPE에 NoneTypeDecoder를 등록하므로 UnknownEvent가 아닌 NoneTypeEvent가 온다.
-        NoneTypeEvent event = assertInstanceOf(NoneTypeEvent.class, received.get());
+        UnknownEvent event = assertInstanceOf(UnknownEvent.class, received.get());
         assertEquals(ChatEvent.NONE_TYPE, event.eventType());
-        assertEquals(7, event.value());
+        assertEquals(9999, event.code());
+        assertEquals(message, event.originalMessage());
+        assertEquals(message, event.raw());
     }
 
     private static ExecutorService directExecutor() {
