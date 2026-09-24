@@ -52,6 +52,27 @@ jobs:
             fi
           fi
 
+      # 태그가 develop의 과거 커밋을 가리키면, 아래 amend + force-push가 그 뒤의 develop 커밋을 지워 버린다.
+      - name: Ensure the release commit is the tip of develop
+        run: |
+          git fetch origin develop
+          ORIG_SHA="$(git rev-parse HEAD)"
+          DEVELOP_SHA="$(git rev-parse origin/develop)"
+          if [ "$ORIG_SHA" != "$DEVELOP_SHA" ]; then
+            echo "::error::Release commit $ORIG_SHA is not the tip of develop ($DEVELOP_SHA). Tag the tip of develop."
+            exit 1
+          fi
+          echo "ORIG_SHA=${ORIG_SHA}" >> "$GITHUB_ENV"
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'oracle'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
       - name: Update version in README.md
         run: |
           sed -i "s|implementation 'com.github.getCurrentThread:soopapi:[^']*'|implementation 'com.github.getCurrentThread:soopapi:v${VERSION}'|g" README.md
@@ -76,6 +97,18 @@ jobs:
           grep -qx -- "- 버전: v${VERSION}" llms-full.txt \
             || { echo "::error::llms-full.txt version line not updated to v${VERSION}."; exit 1; }
 
+      - name: Update install lines in llms docs
+        run: |
+          for f in llms.txt llms-full.txt; do
+            sed -i "s|implementation 'com.github.getCurrentThread:soopapi:[^']*'|implementation 'com.github.getCurrentThread:soopapi:v${VERSION}'|g" "$f"
+            grep -qF -- "implementation 'com.github.getCurrentThread:soopapi:v${VERSION}'" "$f" \
+              || { echo "::error::$f install line not updated to v${VERSION}."; exit 1; }
+          done
+
+      # 태그를 달기 전에, 태그될 내용 그대로 빌드와 테스트를 통과하는지 확인한다.
+      - name: Build and test
+        run: ./gradlew :lib:build
+
       - name: Amend bump, retag, and push
         run: |
           git config user.name  "github-actions[bot]"
@@ -91,7 +124,8 @@ jobs:
           else
             git tag -af "v${VERSION}" -m "Release v${VERSION}" HEAD
           fi
-          git push --force-with-lease origin HEAD:develop
+          # develop이 위 검사 이후에 움직였으면 push가 거부된다.
+          git push --force-with-lease=refs/heads/develop:"${ORIG_SHA}" origin HEAD:develop
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             git push origin "v${VERSION}"
           else
