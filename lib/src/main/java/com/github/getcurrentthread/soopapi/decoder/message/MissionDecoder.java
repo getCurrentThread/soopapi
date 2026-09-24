@@ -5,24 +5,10 @@ import java.util.Map;
 import com.github.getcurrentthread.soopapi.event.ChatEvent;
 import com.github.getcurrentthread.soopapi.event.model.BaseEvent;
 import com.github.getcurrentthread.soopapi.event.model.MissionEvent;
-import com.github.getcurrentthread.soopapi.util.GsonUtil;
 
-public class MissionDecoder implements IMessageDecoder {
-    private static final int MIN_PARTS = 1;
-
+public class MissionDecoder extends JsonPayloadDecoder {
     @Override
-    public BaseEvent decode(String[] parts, String raw) {
-        if (parts.length < MIN_PARTS) {
-            return null;
-        }
-        try {
-            Map<String, Object> data = GsonUtil.fromJson(parts[0]);
-            if (data == null) {
-                return null;
-            }
-            return new MissionEvent(data, ChatEvent.MISSION, raw, System.currentTimeMillis());
-        } catch (Exception e) {
-            return null;
-        }
+    BaseEvent create(Map<String, Object> data, String raw) {
+        return new MissionEvent(data, ChatEvent.MISSION, raw, System.currentTimeMillis());
     }
 }

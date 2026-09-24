@@ -14,7 +14,8 @@ public class DefaultMessageDecoderFactory implements MessageDecoderFactory {
                     Map.entry(ChatEvent.OGQ_EMOTICON_GIFT, new GiftOGQEmoticonDecoder()),
                     Map.entry(ChatEvent.MANAGER_CHAT, new ManagerChatDecoder()),
                     Map.entry(ChatEvent.CHOCOLATE, new ChocolateDecoder()),
-                    Map.entry(ChatEvent.CHOCOLATE_SUB, new ChocolateDecoder()),
+                    Map.entry(
+                            ChatEvent.CHOCOLATE_SUB, new ChocolateDecoder(ChatEvent.CHOCOLATE_SUB)),
                     Map.entry(ChatEvent.SEND_QUICK_VIEW, new QuickViewDecoder()),
                     Map.entry(ChatEvent.GIFT_TICKET, new GiftTicketDecoder()),
                     Map.entry(ChatEvent.VOD_BALLOON, new VODBalloonDecoder()),

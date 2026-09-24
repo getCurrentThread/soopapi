@@ -2,10 +2,13 @@ package com.github.getcurrentthread.soopapi.util;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+import java.math.BigInteger;
 import java.util.List;
 import java.util.Map;
 
 import org.junit.jupiter.api.Test;
+
+import com.google.gson.JsonParseException;
 
 class GsonUtilTest {
 
@@ -112,5 +115,37 @@ class GsonUtilTest {
         Map<String, Object> result = GsonUtil.fromJson("{\"val\": 2147483648}");
         assertInstanceOf(Long.class, result.get("val"));
         assertEquals(2147483648L, result.get("val"));
+    }
+
+    @Test
+    void maxLongBoundary() {
+        Map<String, Object> result = GsonUtil.fromJson("{\"val\": 9223372036854775807}");
+        assertInstanceOf(Long.class, result.get("val"));
+        assertEquals(Long.MAX_VALUE, result.get("val"));
+    }
+
+    @Test
+    void beyondLongRange_keepsExactBigInteger() {
+        Map<String, Object> result =
+                GsonUtil.fromJson(
+                        "{\"big\": 12345678901234567891, \"neg\": -12345678901234567891}");
+        assertEquals(new BigInteger("12345678901234567891"), result.get("big"));
+        assertEquals(new BigInteger("-12345678901234567891"), result.get("neg"));
+    }
+
+    @Test
+    void jsonNullLiteral_returnsNull() {
+        assertNull(GsonUtil.fromJson("null"));
+    }
+
+    @Test
+    void arrayRoot_throwsJsonParseException() {
+        assertThrows(JsonParseException.class, () -> GsonUtil.fromJson("[1,2]"));
+    }
+
+    @Test
+    void primitiveRoot_throwsJsonParseException() {
+        assertThrows(JsonParseException.class, () -> GsonUtil.fromJson("\"text\""));
+        assertThrows(JsonParseException.class, () -> GsonUtil.fromJson("42"));
     }
 }

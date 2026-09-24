@@ -1,6 +1,7 @@
 package com.github.getcurrentthread.soopapi.util;
 
 import java.lang.reflect.Type;
+import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -21,6 +22,13 @@ public class GsonUtil {
                 .create();
     }
 
+    /**
+     * JSON 객체 문자열을 {@code Map}으로 변환합니다.
+     *
+     * <p>입력이 {@code null}이거나 JSON {@code null}이면 {@code null}을 반환합니다. 형식이 잘못되었거나 루트가 객체가 아니면 {@link
+     * JsonParseException}을 던집니다. 정수는 크기에 따라 {@code Integer}, {@code Long}, {@code BigInteger} 중
+     * 하나로, 소수와 지수 표기는 {@code Double}로 변환합니다.
+     */
     public static Map<String, Object> fromJson(String json) {
         return gson.fromJson(json, MAP_TYPE);
     }
@@ -31,6 +39,12 @@ public class GsonUtil {
         public Map<String, Object> deserialize(
                 JsonElement json, Type typeOfT, JsonDeserializationContext context)
                 throws JsonParseException {
+            // JSON null은 Gson이 먼저 걸러 null을 반환하므로 여기에는 오지 않는다.
+            if (!json.isJsonObject()) {
+                throw new JsonParseException(
+                        "Expected a JSON object but was "
+                                + (json.isJsonArray() ? "an array" : "a primitive"));
+            }
             return (Map<String, Object>) ParseObjectFromElement.INSTANCE.apply(json);
         }
     }
@@ -55,7 +69,12 @@ public class GsonUtil {
                             }
                             return longVal;
                         } catch (NumberFormatException e) {
-                            return number.doubleValue();
+                            // long 범위를 넘는 정수는 정밀도를 잃지 않도록 BigInteger로 보존한다.
+                            try {
+                                return new BigInteger(numStr);
+                            } catch (NumberFormatException notInteger) {
+                                return number.doubleValue();
+                            }
                         }
                     }
                     return number.doubleValue();
