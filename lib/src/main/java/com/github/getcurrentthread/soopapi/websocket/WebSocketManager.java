@@ -329,10 +329,7 @@ public class WebSocketManager implements AutoCloseable {
         if (task != null) {
             task.cancel(false);
         }
-        if (seq != null) {
-            seq.completeExceptionally(closedException());
-        }
-        failWaiters.run();
+        // terminated를 먼저 완료한다. 연결 future의 실패를 본 쪽은 terminated도 이미 끝나 있어야 한다.
         terminated.complete(
                 new DisconnectedEvent(
                         WebSocket.NORMAL_CLOSURE,
@@ -341,6 +338,10 @@ public class WebSocketManager implements AutoCloseable {
                         ChatEvent.DISCONNECTED,
                         "",
                         System.currentTimeMillis()));
+        failWaiters.run();
+        if (seq != null) {
+            seq.completeExceptionally(closedException());
+        }
         if (ws != null) {
             closeGracefully(ws);
         }
@@ -658,13 +659,6 @@ public class WebSocketManager implements AutoCloseable {
                                 + reason);
                 closed = true;
                 retire(sock);
-                after.add(
-                        failReady(
-                                new ConnectionException(
-                                        "Connection closed by server: "
-                                                + statusCode
-                                                + " "
-                                                + reason)));
                 DisconnectedEvent event =
                         new DisconnectedEvent(
                                 statusCode,
@@ -674,6 +668,13 @@ public class WebSocketManager implements AutoCloseable {
                                 "",
                                 System.currentTimeMillis());
                 after.add(() -> terminated.complete(event));
+                after.add(
+                        failReady(
+                                new ConnectionException(
+                                        "Connection closed by server: "
+                                                + statusCode
+                                                + " "
+                                                + reason)));
             }
         } finally {
             lock.unlock();
@@ -805,11 +806,12 @@ public class WebSocketManager implements AutoCloseable {
         Runnable failWaiters = failReady(failure);
         after.add(
                 () -> {
+                    // close()와 같은 순서: terminated가 먼저 끝나야 연결 future의 실패를 본 쪽이 종료도 본다.
+                    terminated.completeExceptionally(failure);
+                    failWaiters.run();
                     if (seq != null) {
                         seq.completeExceptionally(failure);
                     }
-                    failWaiters.run();
-                    terminated.completeExceptionally(failure);
                 });
     }
 
