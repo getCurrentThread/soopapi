@@ -24,6 +24,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import com.github.getcurrentthread.soopapi.api.model.AuthCookie;
 import com.github.getcurrentthread.soopapi.config.SOOPChatConfig;
 import com.github.getcurrentthread.soopapi.decoder.MessageDispatcher;
 import com.github.getcurrentthread.soopapi.event.ChatEvent;
@@ -488,6 +489,238 @@ class WebSocketManagerTest {
         assertTrue(ends.getFirst().isClientInitiated());
         assertFalse(mgr.isConnected());
         assertThrows(ExecutionException.class, () -> mgr.sendChat("x").get(1, TimeUnit.SECONDS));
+    }
+
+    /** 실패한 future의 원인. 성공했거나 아직 대기 중이면 테스트를 실패시킨다. */
+    private static Throwable failureOf(CompletableFuture<?> future) {
+        ExecutionException ex =
+                assertThrows(ExecutionException.class, () -> future.get(2, TimeUnit.SECONDS));
+        return ex.getCause();
+    }
+
+    private static boolean joined(CompletableFuture<Void> ready) {
+        return ready.isDone() && !ready.isCompletedExceptionally();
+    }
+
+    @Test
+    void ready_isPendingUntilJoinReplyThenCompleted() throws Exception {
+        opener.then(FakeWebSocket.Opener.Mode.SILENT);
+        WebSocketManager mgr = manager();
+        CompletableFuture<Void> beforeConnect = mgr.ready();
+
+        mgr.connect(CHANNEL);
+        FakeWebSocket ws = opener.last();
+        await(() -> ws.sent.size() == 2, "CONNECT and JOIN sent");
+        CompletableFuture<Void> whileJoining = mgr.ready();
+        whileJoining.complete(null);
+
+        assertFalse(beforeConnect.isDone(), "Not ready before the server answers JOIN");
+        assertFalse(mgr.ready().isDone(), "A caller completing its copy must not open the gate");
+
+        ws.serverText(FakeWebSocket.JOIN_REPLY);
+
+        beforeConnect.get(2, TimeUnit.SECONDS);
+        assertTrue(joined(mgr.ready()), "Once joined, ready() is already completed");
+    }
+
+    @Test
+    void ready_afterAbnormalDrop_waitsForTheNextJoin() throws Exception {
+        opener.then(FakeWebSocket.Opener.Mode.SUCCEED, FakeWebSocket.Opener.Mode.SILENT);
+        WebSocketManager mgr = manager();
+        mgr.connect(CHANNEL).get(2, TimeUnit.SECONDS);
+        CompletableFuture<Void> beforeDrop = mgr.ready();
+
+        opener.last().serverClose(1006, "");
+        CompletableFuture<Void> afterDrop = mgr.ready();
+
+        assertTrue(joined(beforeDrop), "A ready() taken while joined stays completed");
+        assertFalse(afterDrop.isDone(), "A dropped connection is not ready");
+        await(() -> opener.attempts.get() == 2, "retry opened");
+        FakeWebSocket second = opener.last();
+        await(() -> second.sent.size() == 2, "CONNECT and JOIN sent on retry");
+        assertFalse(afterDrop.isDone(), "Opening the retry socket is not joining");
+
+        second.serverText(FakeWebSocket.JOIN_REPLY);
+
+        afterDrop.get(2, TimeUnit.SECONDS);
+        assertTrue(joined(mgr.ready()));
+        assertFalse(mgr.terminated().isDone());
+    }
+
+    @Test
+    void ready_dropBetweenJoinAndGateCompletion_leavesAPendingGate() throws Exception {
+        opener.then(FakeWebSocket.Opener.Mode.SILENT, FakeWebSocket.Opener.Mode.SILENT);
+        WebSocketManager mgr = manager();
+        CompletableFuture<Void> firstJoin = mgr.ready();
+        // onReady는 lock을 놓은 뒤 connect future를 준비 게이트보다 먼저 완료한다. 그 사이에 소켓을 끊어,
+        // 게이트가 아직 대기 상태일 때 끊김이 처리되는 경우를 만든다.
+        CompletableFuture<Void> dropped =
+                mgr.connect(CHANNEL).thenRun(() -> opener.sockets.getFirst().serverClose(1006, ""));
+        FakeWebSocket first = opener.last();
+        await(() -> first.sent.size() == 2, "CONNECT and JOIN sent");
+
+        first.serverText(FakeWebSocket.JOIN_REPLY);
+
+        dropped.get(2, TimeUnit.SECONDS);
+        firstJoin.get(2, TimeUnit.SECONDS);
+        CompletableFuture<Void> next = mgr.ready();
+        assertFalse(next.isDone(), "A socket dropped right after joining must not look ready");
+        await(() -> opener.attempts.get() == 2, "retry opened");
+        FakeWebSocket second = opener.last();
+        await(() -> second.sent.size() == 2, "CONNECT and JOIN sent on retry");
+
+        second.serverText(FakeWebSocket.JOIN_REPLY);
+
+        next.get(2, TimeUnit.SECONDS);
+    }
+
+    @Test
+    void ready_isResetByReconnect() throws Exception {
+        opener.then(FakeWebSocket.Opener.Mode.SUCCEED, FakeWebSocket.Opener.Mode.SILENT);
+        WebSocketManager mgr = manager();
+        mgr.connect(CHANNEL).get(2, TimeUnit.SECONDS);
+        assertTrue(joined(mgr.ready()));
+
+        CompletableFuture<Void> reconnected = mgr.reconnect();
+        CompletableFuture<Void> ready = mgr.ready();
+
+        assertFalse(ready.isDone(), "ready() waits for the replacement socket to join");
+        FakeWebSocket second = opener.last();
+        await(() -> second.sent.size() == 2, "CONNECT and JOIN sent on the new socket");
+        second.serverText(FakeWebSocket.JOIN_REPLY);
+
+        ready.get(2, TimeUnit.SECONDS);
+        reconnected.get(2, TimeUnit.SECONDS);
+    }
+
+    @Test
+    void ready_failsOnClose() throws Exception {
+        opener.then(FakeWebSocket.Opener.Mode.SILENT);
+        WebSocketManager mgr = manager();
+        mgr.connect(CHANNEL);
+        CompletableFuture<Void> pending = mgr.ready();
+
+        mgr.close();
+
+        assertInstanceOf(ConnectionException.class, failureOf(pending));
+        assertInstanceOf(ConnectionException.class, failureOf(mgr.ready()));
+    }
+
+    @Test
+    void ready_afterCloseOfJoinedConnection_fails() throws Exception {
+        WebSocketManager mgr = manager();
+        mgr.connect(CHANNEL).get(2, TimeUnit.SECONDS);
+
+        mgr.close();
+
+        assertInstanceOf(ConnectionException.class, failureOf(mgr.ready()));
+    }
+
+    @Test
+    void ready_failsWhenRetriesAreExhausted() throws Exception {
+        opener.defaultMode = FakeWebSocket.Opener.Mode.FAIL;
+        WebSocketManager mgr = manager();
+        CompletableFuture<Void> pending = mgr.ready();
+
+        mgr.connect(CHANNEL);
+
+        assertInstanceOf(ConnectionException.class, failureOf(pending));
+        assertInstanceOf(ConnectionException.class, failureOf(mgr.ready()));
+    }
+
+    @Test
+    void ready_failsWhenTheServerClosesTheConnection() throws Exception {
+        WebSocketManager mgr = manager();
+        mgr.connect(CHANNEL).get(2, TimeUnit.SECONDS);
+
+        opener.last().serverClose(4000, "kicked");
+
+        Throwable cause = failureOf(mgr.ready());
+        assertInstanceOf(ConnectionException.class, cause);
+        assertTrue(cause.getMessage().contains("4000"));
+    }
+
+    /** 인증 연결의 JOIN 응답. 채팅 번호 1000, userFlag(synAck) "16|16384". */
+    private static final String AUTH_JOIN_REPLY =
+            "\u001b\t000200003000\u000c1000\u000cbj1\u000c0\u000c10\u000c\u000c0\u000c16|16384\u000c";
+
+    private WebSocketManager authenticatedManager() {
+        AuthCookie cookie =
+                new AuthCookie(
+                        "user1", true, "", "ticket0", null, null, null, null, null, "au0", null,
+                        null, null);
+        SOOPChatConfig config =
+                new SOOPChatConfig.Builder()
+                        .bid("bj1")
+                        .maxRetryAttempts(MAX_RETRIES)
+                        .connectionTimeout(Duration.ofSeconds(2))
+                        .authCookie(cookie)
+                        .build();
+        SerialExecutor lane = new SerialExecutor(Runnable::run);
+        MessageDispatcher dispatcher = new MessageDispatcher(Map.of(), lane, emitter);
+        return new WebSocketManager(
+                config,
+                scheduler,
+                lane,
+                dispatcher,
+                emitter,
+                opener,
+                attempt -> 0L,
+                WebSocketManager.JOIN_RESEND_INTERVAL_MS);
+    }
+
+    @Test
+    void enterInfo_isQueuedBeforeReadyWaitersCanSend() throws Exception {
+        opener.then(FakeWebSocket.Opener.Mode.SILENT);
+        WebSocketManager mgr = authenticatedManager();
+        mgr.connect(CHANNEL);
+        FakeWebSocket ws = opener.last();
+        await(() -> ws.sent.size() == 2, "CONNECT and JOIN sent");
+        // ready()는 수신 스레드에서 dispatcher보다 먼저 완료되므로, 곧바로 보낸 메시지가 ENTER_INFO를 앞지르면 안 된다.
+        CompletableFuture<Void> chat = mgr.ready().thenCompose(unused -> mgr.sendChat("hi"));
+
+        ws.serverText(AUTH_JOIN_REPLY);
+
+        chat.get(2, TimeUnit.SECONDS);
+        assertEquals(
+                List.of(
+                        WebSocketPacketBuilder.createEnterInfoPacket("16|16384"),
+                        WebSocketPacketBuilder.createChatPacket("hi")),
+                ws.sent.subList(2, ws.sent.size()));
+    }
+
+    @Test
+    void enterInfo_followsEachJoinReplyOfThisChannel() throws Exception {
+        opener.then(FakeWebSocket.Opener.Mode.SILENT);
+        WebSocketManager mgr = authenticatedManager();
+        mgr.connect(CHANNEL);
+        FakeWebSocket ws = opener.last();
+        await(() -> ws.sent.size() == 2, "CONNECT and JOIN sent");
+        String enterInfo = WebSocketPacketBuilder.createEnterInfoPacket("16|16384");
+
+        ws.serverText(AUTH_JOIN_REPLY);
+        ws.serverText(AUTH_JOIN_REPLY.replace("\u000c1000\u000c", "\u000c2000\u000c"));
+        ws.serverText(FakeWebSocket.JOIN_REPLY);
+        ws.serverText(AUTH_JOIN_REPLY);
+
+        assertEquals(
+                List.of(enterInfo, enterInfo),
+                ws.sent.subList(2, ws.sent.size()),
+                "Another channel's reply and a reply without userFlag send nothing");
+    }
+
+    @Test
+    void enterInfo_isNotSentOnAnonymousConnections() throws Exception {
+        opener.then(FakeWebSocket.Opener.Mode.SILENT);
+        WebSocketManager mgr = manager();
+        mgr.connect(CHANNEL);
+        FakeWebSocket ws = opener.last();
+        await(() -> ws.sent.size() == 2, "CONNECT and JOIN sent");
+
+        ws.serverText(AUTH_JOIN_REPLY);
+
+        assertTrue(mgr.isConnected());
+        assertEquals(List.of(connectPacket(), joinPacket()), ws.sent);
     }
 
     @Test

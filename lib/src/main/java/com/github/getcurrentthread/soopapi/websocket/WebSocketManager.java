@@ -21,15 +21,19 @@ import java.util.logging.Logger;
 import javax.net.ssl.SSLContext;
 
 import com.github.getcurrentthread.soopapi.config.SOOPChatConfig;
+import com.github.getcurrentthread.soopapi.constant.SOOPConstants;
 import com.github.getcurrentthread.soopapi.decoder.MessageDispatcher;
+import com.github.getcurrentthread.soopapi.decoder.message.JoinChannelDecoder;
 import com.github.getcurrentthread.soopapi.event.ChatEvent;
 import com.github.getcurrentthread.soopapi.event.EventEmitter;
 import com.github.getcurrentthread.soopapi.event.model.BaseEvent;
 import com.github.getcurrentthread.soopapi.event.model.DisconnectedEvent;
+import com.github.getcurrentthread.soopapi.event.model.JoinChannelEvent;
 import com.github.getcurrentthread.soopapi.event.model.ReconnectedEvent;
 import com.github.getcurrentthread.soopapi.event.model.ReconnectingEvent;
 import com.github.getcurrentthread.soopapi.exception.ConnectionException;
 import com.github.getcurrentthread.soopapi.model.ChannelInfo;
+import com.github.getcurrentthread.soopapi.util.SOOPChatUtils;
 import com.github.getcurrentthread.soopapi.util.SSLContextProvider;
 import com.github.getcurrentthread.soopapi.util.SerialExecutor;
 
@@ -40,9 +44,14 @@ import com.github.getcurrentthread.soopapi.util.SerialExecutor;
  *   <li><b>수립</b>은 서버가 JOIN에 응답한 시점입니다. 서버는 같은 클라이언트의 이전 세션이 정리되기 전(수 초)에 온 JOIN을 조용히 무시하므로, 응답이
  *       없으면 같은 소켓에 JOIN을 주기적으로 다시 보내고, 끝내 응답이 없으면 그 시도를 실패로 처리합니다.
  *   <li><b>송신</b>은 소켓별 체인으로 직렬화됩니다. CONNECT·JOIN이 항상 먼저 나가고, 이후 송신은 앞선 송신이 끝난 뒤에 나갑니다.
+ *   <li><b>ENTER_INFO</b>: 인증 연결은 JOIN 응답을 받을 때마다 그 userFlag(synAck)로 ENTER_INFO를 체인에 넣습니다. 수신
+ *       스레드에서 준비 게이트를 열기 전, dispatcher에 넘기기 전에 넣으므로 {@link #ready()}나 JOIN_CHANNEL 리스너에서 보낸 메시지는 항상
+ *       ENTER_INFO 뒤에 나갑니다.
  *   <li><b>소켓 식별</b>은 {@code Socket} 객체로 합니다. 교체되거나 닫힌 소켓의 콜백은 무시되고, 그 소켓의 수신 데이터는 버려집니다.
  *   <li><b>끊김 정책</b>: 수립된 소켓이 Close 프레임(1006 제외)을 받으면 연결을 끝냅니다({@link #terminated()} 정상 완료). 전송 오류,
  *       1006, 송신·ping 실패는 backoff 재연결로 복구하고, 재시도를 다 쓰면 {@link #terminated()}가 예외로 완료됩니다.
+ *   <li><b>준비</b>: {@link #ready()}는 현재 소켓이 채널에 들어가 있으면 완료되고, 연결 중이거나 재연결을 기다리는 동안에는 다음 JOIN 응답까지
+ *       대기하며, 연결이 끝나면 예외로 완료됩니다.
  *   <li><b>이벤트</b>: 재시도를 예약할 때마다 {@link ChatEvent#RECONNECTING}, 수립된 연결을 복구했을 때 {@link
  *       ChatEvent#RECONNECTED}를 lane에서 emit합니다.
  * </ul>
@@ -56,6 +65,7 @@ public class WebSocketManager implements AutoCloseable {
     static final long JOIN_RESEND_INTERVAL_MS = 1000;
     static final long MAX_JOIN_WAIT_MS = 10_000;
     private static final int ABNORMAL_CLOSURE = 1006;
+    private static final JoinChannelDecoder JOIN_DECODER = new JoinChannelDecoder();
 
     /** WebSocket용 HttpClient는 SSLContext마다 하나를 공유하며 닫지 않습니다. 스레드는 모두 데몬입니다. */
     private static final Map<SSLContext, HttpClient> SHARED_CLIENTS = new ConcurrentHashMap<>();
@@ -86,12 +96,15 @@ public class WebSocketManager implements AutoCloseable {
     private URI uri;
     private String connectPacket;
     private String joinPacket;
+    private String chatNo;
     private CompletableFuture<Void> sequence;
     private boolean recovery;
     private int retryCount;
     private ScheduledFuture<?> retryTask;
     private Throwable lastFailure;
     private int socketSeq;
+    // 준비 게이트. 채널에 들어간 소켓이 있으면 완료, 연결 중·재연결 대기 중이면 대기, 연결이 끝나면 실패 상태다.
+    private CompletableFuture<Void> readyGate = new CompletableFuture<>();
     // 쓰기는 lock 안에서만, 읽기는 lock 없이도 한다.
     private volatile Socket current;
     private volatile boolean closed;
@@ -191,6 +204,7 @@ public class WebSocketManager implements AutoCloseable {
             uri = target;
             connectPacket = WebSocketPacketBuilder.createConnectPacket(authTicket);
             joinPacket = WebSocketPacketBuilder.createJoinPacket(channelInfo, authTicket, uuid);
+            chatNo = channelInfo.CHATNO();
             seq = sequence = new CompletableFuture<>();
             recovery = false;
             open = startAttempt();
@@ -226,6 +240,9 @@ public class WebSocketManager implements AutoCloseable {
             seq = sequence = new CompletableFuture<>();
             recovery = true;
             if (sock != null) {
+                if (sock.ready) {
+                    resetReady();
+                }
                 WebSocket old = retire(sock);
                 if (old != null) {
                     after.add(() -> closeGracefully(old));
@@ -260,12 +277,37 @@ public class WebSocketManager implements AutoCloseable {
         return terminated.copy();
     }
 
-    /** 연결을 닫습니다. 여러 번 호출해도 안전하며, 이후 연결·송신은 모두 실패합니다. */
+    /**
+     * 채널에 들어갔음을(서버가 JOIN에 응답했음을) 알리는 future.
+     *
+     * <ul>
+     *   <li>현재 소켓이 채널에 들어가 있으면 이미 완료된 future
+     *   <li>연결 중이거나 재연결을 기다리는 중이면 다음 JOIN 응답에서 완료
+     *   <li>그 전에 연결이 끝나면({@link #close()}, 서버의 Close 프레임, 재시도 소진) {@link ConnectionException}으로 예외
+     *       완료
+     * </ul>
+     *
+     * <p>future는 lock 밖에서, 대개 JOIN 응답을 받은 수신 스레드에서 완료됩니다. 호출마다 복사본을 돌려주므로 호출자가 완료해도 내부 상태는 바뀌지
+     * 않습니다.
+     */
+    public CompletableFuture<Void> ready() {
+        CompletableFuture<Void> gate;
+        lock.lock();
+        try {
+            gate = readyGate;
+        } finally {
+            lock.unlock();
+        }
+        return gate.copy();
+    }
+
+    /** 연결을 닫습니다. 여러 번 호출해도 안전하며, 이후 연결·송신·{@link #ready()}는 모두 실패합니다. */
     @Override
     public void close() {
         WebSocket ws = null;
         CompletableFuture<Void> seq;
         ScheduledFuture<?> task;
+        Runnable failWaiters;
         lock.lock();
         try {
             if (closed) {
@@ -276,6 +318,7 @@ public class WebSocketManager implements AutoCloseable {
             retryTask = null;
             seq = sequence;
             sequence = null;
+            failWaiters = failReady(closedException());
             Socket sock = current;
             if (sock != null) {
                 ws = retire(sock);
@@ -289,6 +332,7 @@ public class WebSocketManager implements AutoCloseable {
         if (seq != null) {
             seq.completeExceptionally(closedException());
         }
+        failWaiters.run();
         terminated.complete(
                 new DisconnectedEvent(
                         WebSocket.NORMAL_CLOSURE,
@@ -474,9 +518,57 @@ public class WebSocketManager implements AutoCloseable {
         after.forEach(Runnable::run);
     }
 
-    /** 서버가 JOIN에 응답했다. 채널에 들어간 건강한 세션이므로 재시도 횟수도 되돌린다. */
+    /**
+     * 서버가 JOIN에 응답했다(수신 스레드). 인증 연결이면 ENTER_INFO를 먼저 체인에 넣은 뒤 수립 처리를 한다. 준비 게이트는 그 뒤에 열리므로, {@link
+     * #ready()}를 기다리던 쪽이 곧바로 보낸 메시지도 ENTER_INFO 뒤에 나간다.
+     */
+    private void onJoinReply(Socket sock, String reply) {
+        if (config.isAuthenticated()) {
+            queueEnterInfo(sock, reply);
+        }
+        onReady(sock);
+    }
+
+    /** JOIN 응답의 userFlag(synAck)로 ENTER_INFO를 이 소켓의 체인에 넣는다. 다른 채널의 응답이거나 synAck가 없으면 보내지 않는다. */
+    private void queueEnterInfo(Socket sock, String reply) {
+        String packet;
+        String replyChatNo;
+        try {
+            int sep = reply.indexOf(SOOPConstants.F_CHAR);
+            if (!(JOIN_DECODER.decode(SOOPChatUtils.splitFields(reply, sep + 1), reply)
+                    instanceof JoinChannelEvent join)) {
+                return;
+            }
+            String synAck = join.userFlag();
+            if (synAck == null || synAck.isEmpty()) {
+                return;
+            }
+            packet = WebSocketPacketBuilder.createEnterInfoPacket(synAck);
+            replyChatNo = join.chatNo();
+        } catch (RuntimeException e) {
+            LOGGER.log(Level.WARNING, "Failed to build ENTER_INFO", e);
+            return;
+        }
+        Link link;
+        lock.lock();
+        try {
+            if (sock != current
+                    || closed
+                    || sock.ws == null
+                    || !Objects.equals(chatNo, replyChatNo)) {
+                return;
+            }
+            link = enqueue(sock, packet);
+        } finally {
+            lock.unlock();
+        }
+        link.start();
+    }
+
+    /** 소켓의 첫 JOIN 응답이면 수립 처리를 한다. 채널에 들어간 건강한 세션이므로 재시도 횟수도 되돌린다. */
     private void onReady(Socket sock) {
         CompletableFuture<Void> seq;
+        CompletableFuture<Void> gate;
         ReconnectedEvent reconnected = null;
         lock.lock();
         try {
@@ -488,6 +580,7 @@ public class WebSocketManager implements AutoCloseable {
             sock.ping = schedulePing(sock);
             seq = sequence;
             sequence = null;
+            gate = readyGate;
             if (recovery) {
                 reconnected =
                         new ReconnectedEvent(
@@ -508,6 +601,9 @@ public class WebSocketManager implements AutoCloseable {
         if (seq != null) {
             seq.complete(null);
         }
+        // lock을 놓은 뒤라 그 사이에 이 소켓이 끊겼을 수 있다. 끊김 처리는 sock.ready를 보고 새 게이트를 두므로,
+        // 여기서 옛 게이트를 완료해도 이후 호출자는 다음 JOIN을 기다린다.
+        gate.complete(null);
     }
 
     private ScheduledFuture<?> schedulePing(Socket sock) {
@@ -566,6 +662,13 @@ public class WebSocketManager implements AutoCloseable {
                                 + reason);
                 closed = true;
                 retire(sock);
+                after.add(
+                        failReady(
+                                new ConnectionException(
+                                        "Connection closed by server: "
+                                                + statusCode
+                                                + " "
+                                                + reason)));
                 DisconnectedEvent event =
                         new DisconnectedEvent(
                                 statusCode,
@@ -593,6 +696,7 @@ public class WebSocketManager implements AutoCloseable {
                 attemptFailed(sock, cause, after);
             } else {
                 LOGGER.log(Level.WARNING, "WebSocket #" + sock.id + " failed; reconnecting", cause);
+                resetReady();
                 WebSocket ws = retire(sock);
                 if (ws != null) {
                     after.add(ws::abort);
@@ -702,13 +806,30 @@ public class WebSocketManager implements AutoCloseable {
                         "Connection failed after " + config.getMaxRetryAttempts() + " retries",
                         lastFailure);
         LOGGER.log(Level.SEVERE, "Max retry attempts reached", lastFailure);
+        Runnable failWaiters = failReady(failure);
         after.add(
                 () -> {
                     if (seq != null) {
                         seq.completeExceptionally(failure);
                     }
+                    failWaiters.run();
                     terminated.completeExceptionally(failure);
                 });
+    }
+
+    /**
+     * lock 안에서 호출. 채널에 들어가 있던 소켓을 복구하려고 내릴 때 새 게이트를 둔다. 게이트가 이미 완료됐는지가 아니라 소켓의 {@code ready}로 판단해야
+     * 한다. {@link #onReady}는 lock을 놓은 뒤에 게이트를 완료하므로, 그 사이에 끊기면 게이트는 아직 대기 상태이기 때문이다.
+     */
+    private void resetReady() {
+        readyGate = new CompletableFuture<>();
+    }
+
+    /** lock 안에서 호출. 연결이 끝났으므로 이후의 {@link #ready()}가 곧바로 실패하게 하고, 기다리던 쪽을 lock 밖에서 실패시킬 작업을 돌려준다. */
+    private Runnable failReady(ConnectionException failure) {
+        CompletableFuture<Void> gate = readyGate;
+        readyGate = CompletableFuture.failedFuture(failure);
+        return () -> gate.completeExceptionally(failure);
     }
 
     /** lock 안에서 호출. 소켓을 현재 소켓에서 내리고 ping을 멈추며 수신을 끊는다. 정리할 ws를 돌려준다. */
@@ -795,8 +916,8 @@ public class WebSocketManager implements AutoCloseable {
         }
 
         @Override
-        public void onJoinReply() {
-            onReady(this);
+        public void onJoinReply(String reply) {
+            WebSocketManager.this.onJoinReply(this, reply);
         }
 
         @Override

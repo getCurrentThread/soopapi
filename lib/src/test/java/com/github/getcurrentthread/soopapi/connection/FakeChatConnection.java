@@ -15,6 +15,9 @@ import com.github.getcurrentthread.soopapi.util.SerialExecutor;
 /**
  * 네트워크 없이 동작하는 {@link ChatConnection}. 테스트가 연결 성공·실패·서버 종료를 직접 일으킵니다. {@link ChatConnection} 계약대로
  * {@link #terminated()}는 connect 결과가 정해진 뒤 정확히 한 번 완료됩니다.
+ *
+ * <p>{@link #ready()}는 {@link #establish()}로 채널에 들어가면 완료되고, {@link #drop()}으로 끊기면 다시 대기하며, 연결이 끝나면
+ * 실패합니다. future는 모두 모니터 밖에서 완료합니다.
  */
 public final class FakeChatConnection implements ChatConnection {
     public final SOOPChatConfig config;
@@ -27,6 +30,8 @@ public final class FakeChatConnection implements ChatConnection {
     public final AtomicInteger closeCalls = new AtomicInteger();
     public final AtomicInteger sent = new AtomicInteger();
     private volatile boolean closed;
+    // this로 보호한다.
+    private CompletableFuture<Void> readyGate = new CompletableFuture<>();
 
     FakeChatConnection(SOOPChatConfig config, EventEmitter emitter, SerialExecutor lane) {
         this.config = config;
@@ -34,20 +39,34 @@ public final class FakeChatConnection implements ChatConnection {
         this.lane = lane;
     }
 
-    /** 연결 수립을 흉내 냅니다. */
+    /** 연결 수립(서버의 JOIN 응답)을 흉내 냅니다. {@link #drop()} 뒤에 다시 부르면 재연결에 성공한 것입니다. */
     public void establish() {
         connected.complete(null);
+        CompletableFuture<Void> gate;
+        synchronized (this) {
+            gate = readyGate;
+        }
+        gate.complete(null);
+    }
+
+    /** 수립된 연결이 끊겨 재연결을 기다리는 상황을 흉내 냅니다. 이후 {@link #ready()}는 다시 {@link #establish()}할 때까지 대기합니다. */
+    public synchronized void drop() {
+        if (readyGate.isDone() && !readyGate.isCompletedExceptionally()) {
+            readyGate = new CompletableFuture<>();
+        }
     }
 
     /** 연결 실패(재시도 소진 포함)를 흉내 냅니다. */
     public void fail(String message) {
         ConnectionException error = new ConnectionException(message);
         connected.completeExceptionally(error);
+        failReady(error);
         terminated.completeExceptionally(error);
     }
 
     /** 수립된 연결을 서버가 닫는 상황을 흉내 냅니다. */
     public void serverClose(int code, String reason) {
+        failReady(new ConnectionException("Connection closed by server: " + code + " " + reason));
         terminated.complete(
                 new DisconnectedEvent(
                         code,
@@ -72,10 +91,33 @@ public final class FakeChatConnection implements ChatConnection {
         return closed;
     }
 
+    /** {@link #terminated()} 원본에 걸린 의존 작업 수. 호출마다 작업이 쌓이는지 볼 때 씁니다. */
+    public int terminatedDependents() {
+        return terminated.getNumberOfDependents();
+    }
+
+    private void failReady(ConnectionException error) {
+        CompletableFuture<Void> gate;
+        synchronized (this) {
+            gate = readyGate;
+            readyGate = CompletableFuture.failedFuture(error);
+        }
+        gate.completeExceptionally(error);
+    }
+
+    private synchronized CompletableFuture<Void> readyGate() {
+        return readyGate;
+    }
+
     @Override
     public CompletableFuture<Void> connect() {
         connectCalls.incrementAndGet();
         return connected.copy();
+    }
+
+    @Override
+    public CompletableFuture<Void> ready() {
+        return readyGate().copy();
     }
 
     @Override
@@ -110,14 +152,17 @@ public final class FakeChatConnection implements ChatConnection {
 
     @Override
     public boolean isConnected() {
-        return !closed && connected.isDone() && !connected.isCompletedExceptionally();
+        CompletableFuture<Void> gate = readyGate();
+        return !closed && gate.isDone() && !gate.isCompletedExceptionally();
     }
 
     @Override
     public void close() {
         closeCalls.incrementAndGet();
         closed = true;
-        connected.completeExceptionally(new ConnectionException("Connection closed"));
+        ConnectionException error = new ConnectionException("Connection closed");
+        connected.completeExceptionally(error);
+        failReady(error);
         terminated.complete(
                 new DisconnectedEvent(
                         1000,

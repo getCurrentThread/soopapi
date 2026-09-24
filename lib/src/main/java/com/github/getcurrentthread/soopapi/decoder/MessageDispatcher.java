@@ -41,8 +41,8 @@ public class MessageDispatcher {
     }
 
     /**
-     * {@link ChatEvent#JOIN_CHANNEL}을 사용자 리스너보다 먼저 받는 훅을 등록합니다. 사용자 리스너가 없어도 호출됩니다. 연결 단위 후속
-     * 처리(ENTER_INFO 송신 등)에 씁니다.
+     * {@link ChatEvent#JOIN_CHANNEL}을 사용자 리스너보다 먼저 받는 훅을 등록합니다. 사용자 리스너가 없어도 호출됩니다. 연결 단위 후속 처리에
+     * 씁니다. 인증 연결의 ENTER_INFO는 이 훅이 아니라 WebSocketManager가 수신 스레드에서 보냅니다.
      */
     public void setJoinChannelHook(Consumer<JoinChannelEvent> hook) {
         this.joinChannelHook = hook;

@@ -20,6 +20,7 @@ import java.util.Deque;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
@@ -288,6 +289,19 @@ class SOOPChatClientRealConnectionTest {
 
         assertTrue(connectedCount >= 5, "At least 5 joins required, actual: " + connectedCount);
 
+        // JOIN_CHANNEL을 받은 스트림에서는 ready()가 완료돼야 한다(그 사이 재연결 중이면 다시 들어갈 때 완료).
+        // 그 사이 세션이 끝났으면(방송 종료, 서버 종료) 실패하는 것이 정상이다. DISCONNECTED는 lane에서 뒤따라 온다.
+        List<String> notReady = new ArrayList<>();
+        for (int i = 0; i < clients.size(); i++) {
+            StreamProbe probe = probes.get(i);
+            if (probe.joined.getCount() == 0
+                    && !completesWithin(clients.get(i).ready(), 10, probe.bid + " ready()")
+                    && !disconnectsWithin(probe, 5)) {
+                notReady.add(probe.bid);
+            }
+        }
+        logger.info("=== ready() completed for joined streams, except: " + notReady + " ===");
+
         // === 4단계: ping 주기(기본 60초)가 두 번 넘게 지나도록 관찰 (10초마다 상태 확인) ===
         logger.info("=== Monitoring started (" + MONITOR_SECONDS + "s) ===");
 
@@ -318,14 +332,20 @@ class SOOPChatClientRealConnectionTest {
         forcedProbe.forced = true;
         logger.info("=== forceReconnect on [" + forcedProbe.bid + "] ===");
         clients.get(forcedIdx).forceReconnect();
+        // forceReconnect는 새 연결로 바꿔 끼운 뒤 반환하므로, 이 ready()는 새 연결이 채널에 들어갈 때 완료돼야 한다.
+        CompletableFuture<Void> readyAfterForce = clients.get(forcedIdx).ready();
         boolean rejoined = forcedProbe.joined.await(30, TimeUnit.SECONDS);
+        boolean readyAgain =
+                completesWithin(readyAfterForce, 30, forcedProbe.bid + " ready() after force");
         Thread.sleep(15_000);
         logger.info(
                 String.format(
-                        "[%s] forceReconnect: rejoined=%s, JOIN_CHANNEL=+%d, DISCONNECTED=+%d,"
-                                + " RECONNECTING=%d, RECONNECTED=%d, duplicate chats=%d",
+                        "[%s] forceReconnect: rejoined=%s, ready=%s, JOIN_CHANNEL=+%d,"
+                                + " DISCONNECTED=+%d, RECONNECTING=%d, RECONNECTED=%d,"
+                                + " duplicate chats=%d",
                         forcedProbe.bid,
                         rejoined,
+                        readyAgain,
                         forcedProbe.lifecycleCount(ChatEvent.JOIN_CHANNEL) - joinsBeforeForce,
                         forcedProbe.lifecycleCount(ChatEvent.DISCONNECTED) - disconnectsBeforeForce,
                         forcedProbe.lifecycleCount(ChatEvent.RECONNECTING),
@@ -375,7 +395,14 @@ class SOOPChatClientRealConnectionTest {
 
         // === 9단계: 전달 보장 판정 ===
         List<Executable> checks = new ArrayList<>();
+        checks.add(
+                () ->
+                        assertTrue(
+                                notReady.isEmpty(),
+                                "ready() should complete for joined streams: " + notReady));
         checks.add(() -> assertTrue(rejoined, "forceReconnect should rejoin"));
+        checks.add(
+                () -> assertTrue(readyAgain, "ready() should complete again after forceReconnect"));
         checks.add(
                 () ->
                         assertEquals(
@@ -417,6 +444,33 @@ class SOOPChatClientRealConnectionTest {
         assertAll(checks);
 
         logger.info("=== Test complete ===");
+    }
+
+    /** future가 제한 시간 안에 정상 완료되면 true. 실패나 시간 초과는 로그로 남긴다. */
+    private static boolean completesWithin(CompletableFuture<?> future, long seconds, String what) {
+        try {
+            future.get(seconds, TimeUnit.SECONDS);
+            return true;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        } catch (Exception e) {
+            logger.log(Level.WARNING, what + " did not complete", e);
+            return false;
+        }
+    }
+
+    /** 제한 시간 안에 스트림이 DISCONNECTED를 받으면(세션이 끝났으면) true. */
+    private static boolean disconnectsWithin(StreamProbe probe, long seconds)
+            throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(seconds);
+        while (!probe.disconnected && System.nanoTime() < deadline) {
+            Thread.sleep(50);
+        }
+        if (probe.disconnected) {
+            logger.info("[" + probe.bid + "] session ended before ready(); not counted");
+        }
+        return probe.disconnected;
     }
 
     @SuppressWarnings("unchecked")

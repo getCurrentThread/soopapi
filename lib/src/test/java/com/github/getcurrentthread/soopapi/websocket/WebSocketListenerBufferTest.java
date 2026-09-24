@@ -22,11 +22,12 @@ import com.github.getcurrentthread.soopapi.event.model.RawEvent;
 import com.github.getcurrentthread.soopapi.util.SerialExecutor;
 
 public class WebSocketListenerBufferTest {
+    private static final String JOIN_REPLY = "\u001b\t000200000600\u000c1000\u000c";
 
     private static final WebSocketListener.Callbacks NO_CALLBACKS =
             new WebSocketListener.Callbacks() {
                 @Override
-                public void onJoinReply() {}
+                public void onJoinReply(String reply) {}
 
                 @Override
                 public void onClosed(int statusCode, String reason) {}
@@ -48,13 +49,13 @@ public class WebSocketListenerBufferTest {
     }
 
     @Test
-    void joinReply_isSignalledOncePerSocketBeforeDispatch() {
+    void joinReply_isSignalledBeforeDispatch() {
         java.util.List<String> order = new java.util.concurrent.CopyOnWriteArrayList<>();
         emitter.on(ChatEvent.RAW, (RawEvent e) -> order.add("raw"));
         WebSocketListener.Callbacks callbacks =
                 new WebSocketListener.Callbacks() {
                     @Override
-                    public void onJoinReply() {
+                    public void onJoinReply(String reply) {
                         order.add("join");
                     }
 
@@ -73,7 +74,8 @@ public class WebSocketListenerBufferTest {
         joinListener.onText(stubWebSocket, join, true);
         joinListener.onText(stubWebSocket, join, true);
 
-        assertEquals(List.of("raw", "join", "raw", "raw"), order);
+        // 수립 판정(첫 응답만)은 WebSocketManager가 한다. 인증 연결은 응답마다 ENTER_INFO를 보내야 하므로 매번 알린다.
+        assertEquals(List.of("raw", "join", "raw", "join", "raw"), order);
     }
 
     @Test
@@ -233,8 +235,9 @@ public class WebSocketListenerBufferTest {
         var dispatcher = new MessageDispatcher(Map.of(), lane, emitter);
         var paced = new WebSocketListener(dispatcher, lane, NO_CALLBACKS);
         CountingWebSocket ws = new CountingWebSocket();
+        paced.onText(ws, JOIN_REPLY, true);
 
-        for (int i = 0; i <= WebSocketListener.HIGH_WATER; i++) {
+        for (int i = 1; i <= WebSocketListener.HIGH_WATER; i++) {
             paced.onText(ws, "m" + i, true);
         }
         long requestedWhileBacklogged = ws.requested;
@@ -248,6 +251,41 @@ public class WebSocketListenerBufferTest {
         }
 
         assertEquals(requestedWhileBacklogged + 1, ws.requested, "Reads resume after draining");
+    }
+
+    @Test
+    void backloggedLane_keepsReadingUntilTheFirstJoinReply() {
+        // 리스너가 lane을 붙잡고 입장을 기다리는 동안에도 재연결 소켓은 JOIN 응답까지 읽어야 한다.
+        List<Runnable> pool = new ArrayList<>();
+        SerialExecutor lane = new SerialExecutor(pool::add);
+        for (int i = 0; i <= WebSocketListener.HIGH_WATER; i++) {
+            lane.execute(() -> {});
+        }
+        List<String> joins = new ArrayList<>();
+        WebSocketListener.Callbacks callbacks =
+                new WebSocketListener.Callbacks() {
+                    @Override
+                    public void onJoinReply(String reply) {
+                        joins.add(reply);
+                    }
+
+                    @Override
+                    public void onClosed(int statusCode, String reason) {}
+
+                    @Override
+                    public void onFailed(Throwable error) {}
+                };
+        var paced =
+                new WebSocketListener(
+                        new MessageDispatcher(Map.of(), lane, emitter), lane, callbacks);
+        CountingWebSocket ws = new CountingWebSocket();
+
+        paced.onText(ws, "\u001b\t000100000500\u000cguest\u000c", true);
+        assertEquals(1, ws.requested, "Frames before the JOIN reply are read despite the backlog");
+
+        paced.onText(ws, JOIN_REPLY, true);
+        assertEquals(List.of(JOIN_REPLY), joins);
+        assertEquals(1, ws.requested, "Reads pause once the socket has joined");
     }
 
     /** request() 호출 추적 외에는 아무 동작도 하지 않는 최소한의 WebSocket 스텁. */

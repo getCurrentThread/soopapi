@@ -37,10 +37,16 @@ import com.github.getcurrentthread.soopapi.util.SerialExecutor;
  *   <li>{@link #connectToChat()}으로 세션을 시작합니다. 세션은 {@link #disconnect()}, 서버의 연결 종료, 연결 실패(재시도 소진
  *       포함) 중 하나로 끝나며, 끝날 때 {@link ChatEvent#DISCONNECTED}가 <b>정확히 한 번</b> 발생합니다.
  *   <li>이벤트는 클라이언트마다 도착 순서대로 <b>한 번에 하나씩</b> 전달됩니다. 리스너가 느리면 그 클라이언트의 이벤트가 늦어집니다.
- *   <li>리스너 안에서 {@code sendChat(..).join()}처럼 송신 결과를 기다리는 것은 안전하지만, 세션 future({@link
- *       #connectToChat()}, {@link #forceReconnect()})를 기다리면 교착 상태가 됩니다.
- *   <li>메시지 전송은 {@link ChatEvent#JOIN_CHANNEL}을 받은 뒤에 하세요.
+ *   <li>리스너 안에서 {@code sendChat(..).join()}이나 {@code ready().join()}처럼 기다리는 것은 안전하지만, 세션
+ *       future({@link #connectToChat()}, {@link #forceReconnect()})를 기다리면 교착 상태가 됩니다.
+ *   <li>메시지 전송은 채널에 들어간 뒤에 하세요. {@link #ready()}로 기다리거나 {@link ChatEvent#JOIN_CHANNEL}을 받은 뒤에 보내면
+ *       됩니다.
  * </ul>
+ *
+ * <pre>{@code
+ * chat.connectToChat();
+ * chat.ready().thenRun(() -> chat.sendChat("hi"));
+ * }</pre>
  */
 public class SOOPChatClient implements AutoCloseable {
     private static final Logger LOGGER = Logger.getLogger(SOOPChatClient.class.getName());
@@ -106,8 +112,8 @@ public class SOOPChatClient implements AutoCloseable {
      * 비동기적으로 채팅에 연결합니다.
      *
      * <p>반환된 {@code CompletableFuture}는 세션이 <b>끝날 때</b> 완료됩니다. 사용자 종료나 서버의 연결 종료면 정상 완료, 연결 실패나 재시도
-     * 소진이면 {@link ConnectionException}으로 예외 완료됩니다. 이미 세션이 진행 중이면 같은 future를 반환합니다. 연결됐는지는 {@link
-     * ChatEvent#JOIN_CHANNEL}로 확인하세요.
+     * 소진이면 {@link ConnectionException}으로 예외 완료됩니다. 이미 세션이 진행 중이면 같은 future를 반환합니다. 채널에 들어간 시점은
+     * {@link #ready()}나 {@link ChatEvent#JOIN_CHANNEL}로 확인하세요.
      *
      * @return 세션이 끝날 때 완료되는 CompletableFuture. {@link #close()} 뒤에는 실패한 future
      */
@@ -182,6 +188,88 @@ public class SOOPChatClient implements AutoCloseable {
             } else {
                 throw new ConnectionException("Chat connection failed", e);
             }
+        }
+    }
+
+    /**
+     * 현재 세션이 채널에 들어가면(서버가 JOIN에 응답하면) 완료되는 future를 돌려줍니다.
+     *
+     * <ul>
+     *   <li>지금 채널에 들어가 있으면 이미 완료된 future를 돌려줍니다.
+     *   <li>연결 중이거나 재연결을 기다리는 중이면 세션이 다음에 채널에 들어갈 때 완료됩니다. {@link #forceReconnect()}로 연결이 바뀌어도 실패하지
+     *       않고 새 연결을 기다립니다.
+     *   <li>그 전에 세션이 끝나면({@link #disconnect()}, {@link #close()}, 서버의 연결 종료, 연결 실패, 재시도 소진) {@link
+     *       ConnectionException}으로 예외 완료됩니다.
+     * </ul>
+     *
+     * <p>future는 lane을 거치지 않고, 대개 JOIN 응답을 받은 수신 스레드에서 {@link ChatEvent#JOIN_CHANNEL} 리스너보다 먼저
+     * 완료됩니다. 인증 연결의 ENTER_INFO는 그 전에 송신 순서에 들어가므로, 완료되자마자 보낸 메시지도 ENTER_INFO 뒤에 나갑니다. 리스너 안에서 기다려도
+     * 교착 상태가 되지 않지만, 기다리는 동안 이 클라이언트의 이벤트 전달은 멈춥니다. 이어지는 작업이 오래 걸리면 {@code thenRunAsync}로 넘기세요.
+     *
+     * <p>입장을 기다리는 동안 받은 future는 다음 입장이나 세션 종료까지 연결에 남습니다. 제한 시간을 두고 주기적으로 다시 부르기보다 받은 future 하나를
+     * 재사용하세요.
+     *
+     * <pre>{@code
+     * chat.connectToChat();
+     * chat.ready().thenRun(() -> chat.sendChat("hi"));
+     * }</pre>
+     *
+     * @return 채널에 들어가면 완료되는 future. 진행 중인 세션이 없으면(연결 전, 세션이 끝난 뒤) {@link IllegalStateException}으로,
+     *     {@link #close()} 뒤에는 {@code IllegalStateException("Client is closed")}로 실패한 future
+     */
+    public CompletableFuture<Void> ready() {
+        Session s;
+        ChatConnection c;
+        lock.lock();
+        try {
+            if (closed) {
+                return CompletableFuture.failedFuture(closedException());
+            }
+            s = session;
+            if (s == null) {
+                return CompletableFuture.failedFuture(notConnectedException());
+            }
+            c = s.connection;
+        } finally {
+            lock.unlock();
+        }
+        return awaitReady(s, c);
+    }
+
+    /**
+     * 연결 {@code c}가 채널에 들어가길 기다린다. {@code c}가 끝났어도 세션이 {@link #forceReconnect()}로 다른 연결을 붙였으면 그 연결을
+     * 이어서 기다린다. 세션 종료를 lane에서 처리하는 {@link #onTerminated}를 거치지 않으므로, lane에서 기다려도 막히지 않는다.
+     */
+    private CompletableFuture<Void> awaitReady(Session s, ChatConnection c) {
+        return c.ready()
+                .exceptionallyCompose(
+                        error -> {
+                            ChatConnection next = replacementFor(s, c);
+                            return next != null
+                                    ? awaitReady(s, next)
+                                    : CompletableFuture.failedFuture(toConnectionException(error));
+                        });
+    }
+
+    /**
+     * {@code c}의 ready()가 실패했다(연결이 끝났다). 세션 {@code s}가 아직 현재 세션이고 {@code c} 대신 다른 연결이 붙어 있으면 그 연결을
+     * 돌려준다. {@code c}가 아직 세션의 연결이면 세션은 이 연결과 함께 끝나므로, lane의 {@link #onTerminated}를 기다리지 않고 여기서 떼어 낸
+     * 뒤 null을 돌려준다. 그래야 그 사이에 온 {@link #forceReconnect()}가 끝나는 세션을 이어 붙여 이미 실패한 ready()와 어긋나는 일 없이
+     * 새 세션을 시작한다. DISCONNECTED는 {@link #disconnect()} 때처럼 lane에서 뒤따라 온다.
+     */
+    private ChatConnection replacementFor(Session s, ChatConnection c) {
+        lock.lock();
+        try {
+            if (session != s) {
+                return null;
+            }
+            if (s.connection != c) {
+                return s.connection;
+            }
+            session = null;
+            return null;
+        } finally {
+            lock.unlock();
         }
     }
 
@@ -262,7 +350,8 @@ public class SOOPChatClient implements AutoCloseable {
      *   <li>옛 연결을 닫고 새 연결을 시작한다. 성공하면 {@link ChatEvent#RECONNECTED}를 emit한다.
      * </ol>
      *
-     * <p>{@link ChatEvent#DISCONNECTED}는 발생하지 않습니다. 진행 중인 세션이 없으면 새 세션을 시작합니다.
+     * <p>{@link ChatEvent#DISCONNECTED}는 발생하지 않고, 기다리던 {@link #ready()}도 실패하지 않은 채 새 연결이 채널에 들어갈 때
+     * 완료됩니다. 진행 중인 세션이 없으면 새 세션을 시작합니다.
      *
      * @return 세션이 끝날 때 완료되는 future({@link #connectToChat()}과 같은 객체)
      */
