@@ -68,8 +68,14 @@ tasks.register('collectFixtures', JavaExec) {
 }
 
 test {
+    // 기본은 네트워크를 쓰지 않는 단위 테스트만 돈다. 실서버 테스트는 -PincludeTags=integration으로 켠다.
+    def includeTagsProp = providers.gradleProperty('includeTags').getOrNull()
     useJUnitPlatform {
-        excludeTags 'integration'
+        if (includeTagsProp) {
+            includeTags(*includeTagsProp.split(','))
+        } else {
+            excludeTags 'integration'
+        }
     }
     testLogging {
         showStandardStreams = true

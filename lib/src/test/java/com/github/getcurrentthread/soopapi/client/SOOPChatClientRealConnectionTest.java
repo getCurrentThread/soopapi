@@ -15,15 +15,16 @@ import java.util.Collection;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.Executors;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.FileHandler;
+import java.util.logging.Handler;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.logging.SimpleFormatter;
@@ -45,11 +46,13 @@ class SOOPChatClientRealConnectionTest {
     static final String BROAD_LIST_URL =
             "https://static.file.sooplive.co.kr/pc/ko_KR/main_broad_list_with_adult_json.js";
     static final int TOP_N = 10;
-    static final int TEST_DURATION_MINUTES = 3;
-    static final int MAX_TOTAL_EVENTS = 30;
+    static final int MONITOR_SECONDS = 150;
     static final String LOG_DIR = "test-logs";
 
     static final Logger logger = Logger.getLogger(SOOPChatClientRealConnectionTest.class.getName());
+    static final Logger rootLogger = Logger.getLogger("");
+    static Handler[] originalHandlers;
+    static Level originalLevel;
     static FileHandler normalHandler;
     static FileHandler errorHandler;
 
@@ -60,6 +63,64 @@ class SOOPChatClientRealConnectionTest {
     static final ConcurrentHashMap<ChatEvent, List<BaseEvent>> eventSamples =
             new ConcurrentHashMap<>();
 
+    /** 스트림 하나의 전달 특성(순서, 동시 실행, 종료 후 유입, 재연결 중복)을 관찰한다. */
+    static final class StreamProbe {
+        final String bid;
+        final AtomicInteger inFlight = new AtomicInteger();
+        final AtomicInteger maxInFlight = new AtomicInteger();
+        final AtomicLong lastChatTimestamp = new AtomicLong();
+        final AtomicLong chatOrderViolations = new AtomicLong();
+        final AtomicLong keepAlives = new AtomicLong();
+        final AtomicLong eventsAfterDisconnect = new AtomicLong();
+        final ConcurrentHashMap<ChatEvent, AtomicLong> lifecycle = new ConcurrentHashMap<>();
+        final Set<String> chatRawsAfterForce = ConcurrentHashMap.newKeySet();
+        final AtomicLong duplicateChatsAfterForce = new AtomicLong();
+        volatile boolean forced;
+        volatile boolean disconnected;
+        volatile CountDownLatch joined = new CountDownLatch(1);
+
+        StreamProbe(String bid) {
+            this.bid = bid;
+        }
+
+        void record(BaseEvent event) {
+            int now = inFlight.incrementAndGet();
+            maxInFlight.accumulateAndGet(now, Math::max);
+            try {
+                ChatEvent type = event.eventType();
+                switch (type) {
+                    case JOIN_CHANNEL -> joined.countDown();
+                    case KEEP_ALIVE -> keepAlives.incrementAndGet();
+                    case CHAT_MESSAGE -> {
+                        long prev = lastChatTimestamp.getAndSet(event.timestamp());
+                        if (event.timestamp() < prev) {
+                            chatOrderViolations.incrementAndGet();
+                        }
+                        if (forced && !chatRawsAfterForce.add(event.raw())) {
+                            duplicateChatsAfterForce.incrementAndGet();
+                        }
+                    }
+                    default -> {}
+                }
+                if (type == ChatEvent.DISCONNECTED
+                        || type == ChatEvent.RECONNECTING
+                        || type == ChatEvent.RECONNECTED
+                        || type == ChatEvent.JOIN_CHANNEL) {
+                    lifecycle.computeIfAbsent(type, _ -> new AtomicLong()).incrementAndGet();
+                } else if (disconnected && type != ChatEvent.RAW) {
+                    eventsAfterDisconnect.incrementAndGet();
+                }
+            } finally {
+                inFlight.decrementAndGet();
+            }
+        }
+
+        long lifecycleCount(ChatEvent type) {
+            AtomicLong c = lifecycle.get(type);
+            return c != null ? c.get() : 0;
+        }
+    }
+
     @BeforeAll
     static void setupLogging() throws IOException {
         Path logDir = Path.of(LOG_DIR);
@@ -69,9 +130,11 @@ class SOOPChatClientRealConnectionTest {
                 "java.util.logging.SimpleFormatter.format",
                 "[%1$tF %1$tT] [%4$-7s] %2$s: %5$s%6$s%n");
 
-        Logger rootLogger = Logger.getLogger("");
+        // 이 클래스 동안만 root logger를 파일로 돌리고, 끝나면 원래 설정으로 되돌린다.
+        originalLevel = rootLogger.getLevel();
+        originalHandlers = rootLogger.getHandlers();
         rootLogger.setLevel(Level.ALL);
-        for (var handler : rootLogger.getHandlers()) {
+        for (var handler : originalHandlers) {
             rootLogger.removeHandler(handler);
         }
 
@@ -88,8 +151,20 @@ class SOOPChatClientRealConnectionTest {
 
     @AfterAll
     static void tearDownLogging() {
-        if (normalHandler != null) normalHandler.close();
-        if (errorHandler != null) errorHandler.close();
+        if (normalHandler != null) {
+            rootLogger.removeHandler(normalHandler);
+            normalHandler.close();
+        }
+        if (errorHandler != null) {
+            rootLogger.removeHandler(errorHandler);
+            errorHandler.close();
+        }
+        if (originalHandlers != null) {
+            for (var handler : originalHandlers) {
+                rootLogger.addHandler(handler);
+            }
+        }
+        rootLogger.setLevel(originalLevel);
     }
 
     @Test
@@ -103,22 +178,18 @@ class SOOPChatClientRealConnectionTest {
             var s = topStreamers.get(i);
             logger.info(
                     String.format(
-                            "#%d BID=%s, BNO=%s, nickname=%s, viewers=%s",
-                            i + 1,
-                            s.get("user_id"),
-                            s.get("broad_no"),
-                            s.get("user_nick"),
-                            s.get("total_view_cnt")));
+                            "#%d BID=%s, BNO=%s, viewers=%s",
+                            i + 1, s.get("user_id"), s.get("broad_no"), s.get("total_view_cnt")));
         }
 
         // === 2단계: SOOPChatClient 생성 & 이벤트 리스너 등록 ===
         List<SOOPChatClient> clients = new ArrayList<>();
-        List<String> bids = new ArrayList<>();
+        List<StreamProbe> probes = new ArrayList<>();
 
         for (var streamer : topStreamers) {
             String bid = (String) streamer.get("user_id");
             String bno = String.valueOf(streamer.get("broad_no"));
-            bids.add(bid);
+            StreamProbe probe = new StreamProbe(bid);
 
             SOOPChatConfig config = new SOOPChatConfig.Builder().bid(bid).bno(bno).build();
             SOOPChatClient client = new SOOPChatClient(config);
@@ -127,6 +198,10 @@ class SOOPChatClientRealConnectionTest {
                 client.on(
                         eventType,
                         (BaseEvent event) -> {
+                            probe.record(event);
+                            if (event.eventType() == ChatEvent.RAW) {
+                                return;
+                            }
                             String key = bid + ":" + event.eventType().name();
                             eventCounters
                                     .computeIfAbsent(key, _ -> new AtomicLong(0))
@@ -140,78 +215,54 @@ class SOOPChatClientRealConnectionTest {
                                 samples.add(event);
                             }
 
-                            String logMessage = formatEventLog(bid, event);
-                            logger.info(logMessage);
+                            logger.fine(formatEventLog(bid, event));
                         });
             }
 
             clients.add(client);
+            probes.add(probe);
         }
 
-        // === 3단계: 동시 연결 (Virtual Thread) ===
+        // === 3단계: 동시 연결 ===
+        // connectToChat()의 future는 세션이 끝날 때 완료되므로, 연결 성공은 JOIN_CHANNEL 수신으로 판정한다.
         logger.info("=== Starting concurrent connections ===");
-        AtomicInteger connectedCount = new AtomicInteger(0);
-
-        @SuppressWarnings("unchecked")
-        CompletableFuture<Void>[] futures = new CompletableFuture[clients.size()];
-
         for (int i = 0; i < clients.size(); i++) {
-            final int idx = i;
-            final String bid = bids.get(i);
-            final SOOPChatClient client = clients.get(i);
-
-            futures[i] =
-                    CompletableFuture.runAsync(
-                                    () -> {
-                                        try {
-                                            client.connectToChat().get(30, TimeUnit.SECONDS);
-                                            connectedCount.incrementAndGet();
-                                            logger.info("[" + bid + "] Connected");
-                                        } catch (Exception e) {
-                                            logger.log(
-                                                    Level.WARNING,
-                                                    "["
-                                                            + bid
-                                                            + "] Connection failed: "
-                                                            + e.getMessage(),
-                                                    e);
-                                        }
-                                    },
-                                    Executors.newVirtualThreadPerTaskExecutor())
-                            .orTimeout(35, TimeUnit.SECONDS)
-                            .exceptionally(
-                                    ex -> {
-                                        logger.log(
-                                                Level.WARNING,
-                                                "[" + bids.get(idx) + "] Connection timeout",
-                                                ex);
-                                        return null;
-                                    });
+            String bid = probes.get(i).bid;
+            clients.get(i)
+                    .connectToChat()
+                    .whenComplete(
+                            (v, ex) -> {
+                                if (ex != null) {
+                                    logger.log(Level.WARNING, "[" + bid + "] Session failed", ex);
+                                }
+                            });
         }
 
-        CompletableFuture.allOf(futures).join();
+        long joinDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+        int connectedCount = 0;
+        for (StreamProbe probe : probes) {
+            long remaining = Math.max(0, joinDeadline - System.nanoTime());
+            if (probe.joined.await(remaining, TimeUnit.NANOSECONDS)) {
+                connectedCount++;
+            } else {
+                logger.warning("[" + probe.bid + "] JOIN_CHANNEL not received within 30s");
+            }
+        }
         logger.info(
                 "=== Connection complete: "
-                        + connectedCount.get()
+                        + connectedCount
                         + "/"
                         + clients.size()
-                        + " succeeded ===");
+                        + " joined ===");
 
-        assertTrue(
-                connectedCount.get() >= 5,
-                "At least 5 connections required, actual: " + connectedCount.get());
+        assertTrue(connectedCount >= 5, "At least 5 joins required, actual: " + connectedCount);
 
-        // === 4단계: 최대 3분 또는 30개 이벤트까지 대기 (10초마다 상태 확인) ===
-        logger.info(
-                "=== Monitoring started (max "
-                        + TEST_DURATION_MINUTES
-                        + " min, "
-                        + MAX_TOTAL_EVENTS
-                        + " events) ===");
+        // === 4단계: ping 주기(기본 60초)가 두 번 넘게 지나도록 관찰 (10초마다 상태 확인) ===
+        logger.info("=== Monitoring started (" + MONITOR_SECONDS + "s) ===");
 
-        long deadline = System.currentTimeMillis() + TEST_DURATION_MINUTES * 60_000L;
+        long deadline = System.currentTimeMillis() + MONITOR_SECONDS * 1_000L;
         int logIntervalSec = 0;
-        while (System.currentTimeMillis() < deadline && totalEvents.get() < MAX_TOTAL_EVENTS) {
+        while (System.currentTimeMillis() < deadline) {
             Thread.sleep(10_000);
             logIntervalSec += 10;
 
@@ -224,33 +275,70 @@ class SOOPChatClientRealConnectionTest {
 
         logger.info("Monitoring ended - Total events received: " + totalEvents.get());
 
-        // === 5단계: 정리 & 통계 ===
-        logger.info("=== Final statistics ===");
-        for (String bid : bids) {
-            long chatCount = getCount(bid, "CHAT_MESSAGE");
-            long totalForBid =
-                    eventCounters.entrySet().stream()
-                            .filter(e -> e.getKey().startsWith(bid + ":"))
-                            .mapToLong(e -> e.getValue().get())
-                            .sum();
-            logger.info(
-                    String.format(
-                            "[%s] Total events: %d, Chat messages: %d",
-                            bid, totalForBid, chatCount));
+        // === 5단계: forceReconnect 한 번 — 세션 유지, 중복 전달 여부 관찰 ===
+        int forcedIdx = 0;
+        while (probes.get(forcedIdx).joined.getCount() != 0) {
+            forcedIdx++;
         }
-        logger.info("Total events received: " + totalEvents.get());
+        StreamProbe forcedProbe = probes.get(forcedIdx);
+        long disconnectsBeforeForce = forcedProbe.lifecycleCount(ChatEvent.DISCONNECTED);
+        long joinsBeforeForce = forcedProbe.lifecycleCount(ChatEvent.JOIN_CHANNEL);
+        forcedProbe.joined = new CountDownLatch(1);
+        forcedProbe.forced = true;
+        logger.info("=== forceReconnect on [" + forcedProbe.bid + "] ===");
+        clients.get(forcedIdx).forceReconnect();
+        boolean rejoined = forcedProbe.joined.await(30, TimeUnit.SECONDS);
+        Thread.sleep(15_000);
+        logger.info(
+                String.format(
+                        "[%s] forceReconnect: rejoined=%s, JOIN_CHANNEL=+%d, DISCONNECTED=+%d,"
+                                + " RECONNECTING=%d, RECONNECTED=%d, duplicate chats=%d",
+                        forcedProbe.bid,
+                        rejoined,
+                        forcedProbe.lifecycleCount(ChatEvent.JOIN_CHANNEL) - joinsBeforeForce,
+                        forcedProbe.lifecycleCount(ChatEvent.DISCONNECTED) - disconnectsBeforeForce,
+                        forcedProbe.lifecycleCount(ChatEvent.RECONNECTING),
+                        forcedProbe.lifecycleCount(ChatEvent.RECONNECTED),
+                        forcedProbe.duplicateChatsAfterForce.get()));
 
-        // === 6단계: 파싱 검증 리포트 생성 ===
-        generateParsingReport();
-
-        // 모든 클라이언트 disconnect
-        for (var client : clients) {
+        // === 6단계: 모든 클라이언트 disconnect 후 유입 이벤트 관찰 ===
+        for (int i = 0; i < clients.size(); i++) {
+            probes.get(i).disconnected = true;
             try {
-                client.disconnect();
+                clients.get(i).disconnect();
             } catch (Exception e) {
                 logger.log(Level.WARNING, "Disconnect error", e);
             }
         }
+        Thread.sleep(3_000);
+
+        // === 7단계: 정리 & 통계 ===
+        logger.info("=== Final statistics ===");
+        for (StreamProbe probe : probes) {
+            long chatCount = getCount(probe.bid, "CHAT_MESSAGE");
+            long totalForBid =
+                    eventCounters.entrySet().stream()
+                            .filter(e -> e.getKey().startsWith(probe.bid + ":"))
+                            .mapToLong(e -> e.getValue().get())
+                            .sum();
+            logger.info(
+                    String.format(
+                            "[%s] events=%d, chats=%d, maxConcurrentListeners=%d,"
+                                    + " chatOrderViolations=%d, keepAlives=%d,"
+                                    + " eventsAfterDisconnect=%d, DISCONNECTED=%d",
+                            probe.bid,
+                            totalForBid,
+                            chatCount,
+                            probe.maxInFlight.get(),
+                            probe.chatOrderViolations.get(),
+                            probe.keepAlives.get(),
+                            probe.eventsAfterDisconnect.get(),
+                            probe.lifecycleCount(ChatEvent.DISCONNECTED)));
+        }
+        logger.info("Total events received: " + totalEvents.get());
+
+        // === 8단계: 파싱 검증 리포트 생성 ===
+        generateParsingReport();
 
         logger.info("=== Test complete ===");
     }

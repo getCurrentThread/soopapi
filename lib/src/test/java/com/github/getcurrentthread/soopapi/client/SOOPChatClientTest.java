@@ -1,17 +1,15 @@
 package com.github.getcurrentthread.soopapi.client;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
-import java.util.Arrays;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
-import java.util.logging.ConsoleHandler;
 import java.util.logging.Level;
 import java.util.logging.Logger;
-import java.util.logging.SimpleFormatter;
 
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
@@ -29,23 +27,6 @@ public class SOOPChatClientTest {
 
     private static final Logger LOGGER = Logger.getLogger(SOOPChatClientTest.class.getName());
 
-    @BeforeEach
-    public void setup() {
-        System.setProperty(
-                "java.util.logging.SimpleFormatter.format",
-                "[%1$tF %1$tT] [%4$-7s] %2$s: %5$s%6$s%n");
-
-        Logger rootLogger = Logger.getLogger("");
-        rootLogger.setLevel(Level.ALL);
-
-        Arrays.stream(rootLogger.getHandlers()).forEach(rootLogger::removeHandler);
-
-        ConsoleHandler handler = new ConsoleHandler();
-        handler.setLevel(Level.ALL);
-        handler.setFormatter(new SimpleFormatter());
-        rootLogger.addHandler(handler);
-    }
-
     @Test
     @Tag("integration")
     public void testSOOPChatClientConnection() throws Exception {
@@ -53,7 +34,13 @@ public class SOOPChatClientTest {
         LOGGER.info("Starting test with BID: " + testBID);
 
         SOOPLive soopLive = new SOOPLive(new SOOPHttpClient());
-        String bno = soopLive.getBno(testBID).join();
+        String bno;
+        try {
+            bno = soopLive.getBno(testBID).join();
+        } catch (CompletionException e) {
+            assumeTrue(false, "Streamer is not live: " + e.getCause());
+            return;
+        }
         LOGGER.info("Retrieved BNO: " + bno);
 
         LiveDetail liveDetail = soopLive.detail(testBID, bno).join();
@@ -61,79 +48,39 @@ public class SOOPChatClientTest {
         LOGGER.info("Retrieved channel info: " + channelInfo);
 
         SOOPChatConfig config = new SOOPChatConfig.Builder().bid(testBID).bno(bno).build();
-
-        LOGGER.info("Created config: " + config);
-
         SOOPChatClient client = new SOOPChatClient(config);
-        CountDownLatch connectionLatch = new CountDownLatch(1);
+        // connectToChat()의 future는 세션이 끝날 때 완료되므로, 연결 성공은 JOIN_CHANNEL 수신으로 판정한다.
+        CountDownLatch joinLatch = new CountDownLatch(1);
         CountDownLatch messageLatch = new CountDownLatch(10);
 
+        client.once(ChatEvent.JOIN_CHANNEL, event -> joinLatch.countDown());
         client.on(
                 ChatEvent.CHAT_MESSAGE,
                 (ChatMessageEvent e) -> {
-                    LOGGER.info(e.senderNickname() + ": " + e.message());
+                    LOGGER.fine(e.senderNickname() + ": " + e.message());
                     messageLatch.countDown();
                 });
-
-        client.on(
-                ChatEvent.JOIN_CHANNEL,
-                event -> {
-                    LOGGER.info("Join channel event: " + event);
-                    messageLatch.countDown();
-                });
-
-        client.on(
-                ChatEvent.QUIT_CHANNEL,
-                event -> {
-                    LOGGER.info("Quit channel event: " + event);
-                    messageLatch.countDown();
-                });
-
-        client.on(
-                ChatEvent.CHAT_USER,
-                event -> {
-                    LOGGER.info("Chat user event: " + event);
-                    messageLatch.countDown();
-                });
-
-        LOGGER.info("Connecting to chat...");
+        client.on(ChatEvent.QUIT_CHANNEL, event -> messageLatch.countDown());
+        client.on(ChatEvent.CHAT_USER, event -> messageLatch.countDown());
 
         try {
             client.connectToChat()
-                    .thenRun(
-                            () -> {
-                                LOGGER.info("Connection future completed");
-                                connectionLatch.countDown();
-                            })
                     .exceptionally(
                             throwable -> {
                                 LOGGER.log(Level.SEVERE, "Connection error", throwable);
                                 return null;
                             });
 
-            boolean connected = connectionLatch.await(30, TimeUnit.SECONDS);
-            if (!connected) {
-                LOGGER.warning("Failed to establish connection within timeout");
-                return;
+            assertTrue(
+                    joinLatch.await(30, TimeUnit.SECONDS),
+                    "JOIN_CHANNEL should arrive within 30 seconds");
+            assertTrue(client.isConnected(), "Client should report connected after JOIN_CHANNEL");
+
+            if (!messageLatch.await(60, TimeUnit.SECONDS)) {
+                LOGGER.warning("Timed out waiting for messages (quiet stream?)");
             }
-
-            LOGGER.info("Connected successfully, waiting for messages...");
-
-            boolean received = messageLatch.await(60, TimeUnit.SECONDS);
-
-            if (received) {
-                LOGGER.info("Test passed: Messages received");
-            } else {
-                LOGGER.warning("Test timed out waiting for messages");
-                LOGGER.info("Client connected: " + client.isConnected());
-            }
-        } catch (Exception e) {
-            LOGGER.log(Level.SEVERE, "Test encountered an error", e);
-            throw e;
         } finally {
-            LOGGER.info("Disconnecting...");
             client.disconnect();
-            LOGGER.info("Test completed.");
         }
     }
 
