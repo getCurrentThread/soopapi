@@ -9,15 +9,15 @@
 
 - **이벤트 기반 아키텍처**: 타입 안전한 `on(event, handler)` 패턴으로 이벤트 구독
 - **Sealed 이벤트 계층**: `ChatBaseEvent`, `DonationBaseEvent`, `SystemBaseEvent` 등 6개 카테고리로 분류된 이벤트 타입
-- **93개 이벤트 타입 지원**: 채팅 메시지, 풍선, 이모티콘, 구독 등 모든 이벤트를 Java Record로 디코딩
+- **92개 서버 이벤트 지원**: 채팅 메시지, 풍선, 이모티콘, 구독 등 모든 서버 이벤트를 Java Record로 디코딩(연결 상태 등 클라이언트 이벤트 5개 별도)
 - **코드표 디코딩**: 사용자 등급·아이스 모드·퇴장 사유 등 원시 코드를 `UserLevel`·`ChatIceType`·`ChatQuitStatus`로 지연 디코딩(`senderLevel()`, `iceType()`, `quitStatus()`)
 - **연결 상태 이벤트**: `DISCONNECTED`, `RECONNECTING`, `RECONNECTED` 이벤트로 연결 라이프사이클 추적
-- **Virtual Threads**: JDK 21+ Virtual Thread 기반 비동기 메시지 처리
+- **스트림별 순서 보장**: 이벤트는 스트림마다 도착 순서대로 한 번에 하나씩 전달(공유 가상 스레드 풀 위의 직렬 실행)
 - **통합 API 클라이언트**: `SOOPClient` 파사드로 인증, 방송 정보, 채널 정보, 채팅을 통합 관리
 - **다중 채팅 연결**: bid 기준 dedup된 `add`/`remove`/`get` API와 `(streamerId, event)`를 함께 받는 글로벌 이벤트 리스너 지원
 - **채팅 전송 지원**: `sendChat()` / `sendWhisper()` 메서드로 채팅·귓말 전송
 - **익명(읽기 전용) 연결**: 인증 없이 채팅 수신 가능
-- WebSocket 기반 자동 재연결 및 핑 메커니즘
+- 네트워크 장애 시 backoff 자동 재연결(서버가 연결을 닫으면 세션 종료)
 - 이벤트 리스너 에러 핸들링
 
 ## 필요 조건
@@ -79,11 +79,11 @@ public class Example {
             System.out.println("스테이션: " + station.stationName());
 
             // 글로벌 리스너 먼저 등록 — 이후 추가되는 스트림에 자동 attach됨
-            client.on(ChatEvent.CHAT_MESSAGE, (bid, ChatMessageEvent e) -> {
+            client.on(ChatEvent.CHAT_MESSAGE, (String bid, ChatMessageEvent e) -> {
                 System.out.println("[" + bid + "] " + e.senderNickname() + ": " + e.message());
             });
 
-            client.on(ChatEvent.SEND_BALLOON, (bid, SendBalloonEvent e) -> {
+            client.on(ChatEvent.SEND_BALLOON, (String bid, SendBalloonEvent e) -> {
                 System.out.println("[" + bid + "] " + e.senderNickname()
                         + "님이 풍선 " + e.count() + "개 선물!");
             });
@@ -91,7 +91,7 @@ public class Example {
             // add() 호출 즉시 비동기 연결이 시작됩니다 (별도 connectToChat() 불필요)
             client.add("streamerId");
 
-            // 등록된 모든 연결이 해제될 때까지 블로킹
+            // 등록된 모든 세션이 끝날 때까지 블로킹
             client.connectAll().join();
         }
     }
@@ -105,12 +105,12 @@ public class Example {
 ```java
 try (SOOPClient client = new SOOPClient()) {
     // 글로벌 리스너 먼저 등록 — 이후 add()되는 스트림에도 자동 적용
-    client.on(ChatEvent.CHAT_MESSAGE, (bid, ChatMessageEvent e) -> {
+    client.on(ChatEvent.CHAT_MESSAGE, (String bid, ChatMessageEvent e) -> {
         System.out.println("[" + bid + "] " + e.senderNickname() + ": " + e.message());
     });
 
     // 연결 실패/끊김 추적
-    client.on(ChatEvent.DISCONNECTED, (bid, DisconnectedEvent e) -> {
+    client.on(ChatEvent.DISCONNECTED, (String bid, DisconnectedEvent e) -> {
         if (e.causedByError()) {
             System.err.println("[" + bid + "] 연결 오류로 끊김: " + e.reason());
         }
@@ -127,7 +127,7 @@ try (SOOPClient client = new SOOPClient()) {
     client.reconnect("streamerA");      // 강제 재연결 (tear-down + 새 연결)
     client.remove("streamerB");         // disconnect + 등록 해제
 
-    // 등록된 모든 연결이 해제될 때까지 대기
+    // 등록된 모든 세션이 끝날 때까지 대기
     client.connectAll().join();
 }
 ```
@@ -162,7 +162,7 @@ public class DirectExample {
             System.out.println(e.senderNickname() + ": " + e.message());
         });
 
-        // connectAndAwait()는 연결이 해제될 때까지 블로킹됩니다
+        // connectAndAwait()는 세션이 끝날 때까지 블로킹됩니다
         client.connectAndAwait();
     }
 }
@@ -196,7 +196,7 @@ client.connectAndAwait(); // 채팅 수신 가능, 전송 불가
 ```java
 SOOPClient client = new SOOPClient();
 
-// 1. 로그인 (실패 시 AuthenticationException 발생)
+// 1. 로그인 (실패하면 join()이 AuthenticationException을 원인으로 담은 CompletionException을 던짐)
 AuthCookie cookie = client.auth().signIn("userId", "password").join();
 System.out.println("로그인 성공");
 
@@ -212,15 +212,21 @@ chat.on(ChatEvent.CHAT_MESSAGE, (ChatMessageEvent e) -> {
     System.out.println(e.senderNickname() + ": " + e.message());
 });
 
-// 3. 연결 (비동기)
+// 3. 채널에 입장한 뒤(JOIN_CHANNEL)에 전송합니다
+chat.once(ChatEvent.JOIN_CHANNEL, (JoinChannelEvent e) -> {
+    chat.sendChat("Hello!")
+            .exceptionally(ex -> { System.err.println("전송 실패: " + ex); return null; });
+
+    // 특정 사용자에게 귓말 전송 ("targetUser" = 받는 사람 로그인 ID, 닉네임/(n) 형태 아님)
+    chat.sendWhisper("targetUser", "안녕하세요");
+});
+
+// 4. 연결 시작. 반환된 future는 세션이 끝날 때 완료되므로 여기서 기다리지 않습니다
 chat.connectToChat();
-
-// 4. 연결 완료 후 채팅 전송
-chat.sendChat("Hello!").join();
-
-// 5. 특정 사용자에게 귓말 전송 ("targetUser" = 받는 사람 로그인 ID, 닉네임/(n) 형태 아님)
-chat.sendWhisper("targetUser", "안녕하세요").join();
 ```
+
+- 메시지가 `null`·공백이거나 제어 문자 `U+000C`·`U+001B`를 포함하면 `IllegalArgumentException`으로 실패합니다.
+- 리스너 안에서 `sendChat(..).join()`처럼 **송신 결과**를 기다리는 것은 안전합니다. 하지만 **세션 future**(`connectToChat()`, `connectAndAwait()`, `forceReconnect()`)를 기다리면 이벤트 전달이 멈춰 교착 상태가 됩니다.
 
 ### 연결 상태 이벤트
 
@@ -229,11 +235,20 @@ chat.sendWhisper("targetUser", "안녕하세요").join();
 ```java
 import com.github.getcurrentthread.soopapi.event.model.*;
 
-// 연결 해제 감지
+// 세션 종료 감지 (세션마다 정확히 한 번)
 client.on(ChatEvent.DISCONNECTED, (DisconnectedEvent e) -> {
     System.out.println("연결 해제: code=" + e.statusCode()
             + ", reason=" + e.reason()
             + ", error=" + e.causedByError());
+});
+
+// 직접 끝낸 경우가 아니면 5초 뒤 새 세션 시작 (첫 연결 실패도 포함되므로 방송이 꺼져 있으면 5초마다 다시 시도)
+client.on(ChatEvent.DISCONNECTED, (DisconnectedEvent e) -> {
+    if (e.isClientInitiated()) {
+        return; // disconnect()/close()로 직접 끝낸 경우
+    }
+    CompletableFuture.runAsync(
+            client::connectToChat, CompletableFuture.delayedExecutor(5, TimeUnit.SECONDS));
 });
 
 // 재연결 시도 감지
@@ -270,31 +285,47 @@ client.getEventEmitter().setErrorHandler((EventEmitterException ex) -> {
 SOOPChatConfig config = new SOOPChatConfig.Builder()
         .bid("streamerId")
         .bno("12345")                                  // 방송 번호 (생략 시 자동 해석)
-        .connectionTimeout(Duration.ofSeconds(15))     // 연결 타임아웃 (기본: 30초)
-        .maxRetryAttempts(3)                           // 최대 재시도 횟수 (기본: 5)
+        .connectionTimeout(Duration.ofSeconds(15))     // 연결·송신 타임아웃, 0보다 커야 함 (기본: 30초)
+        .maxRetryAttempts(3)                           // 자동 재연결 최대 재시도 횟수 (기본: 5)
         .pingIntervalSeconds(30)                       // 핑 전송 간격 (기본: 60초)
-        .initialPacketDelayMs(500)                     // 초기 패킷 대기 시간 (기본: 1000ms)
         .authCookie(cookie)                            // 인증 쿠키 (생략 시 읽기 전용)
         .build();
 ```
 
+> `initialPacketDelayMs`는 아무 효과가 없어 deprecated(제거 예정)되었습니다. `SOOPClientConfig`의 `connectionTimeout`은 REST API(`auth()`/`live()`/`channel()`)에만 적용되고, `maxRetryAttempts`는 `add(String)`으로 등록한 스트림의 재시도 한도가 됩니다.
+
 ## 연결 라이프사이클
 
-`SOOPClient.add()`는 등록과 동시에 비동기 연결을 시작하므로 일반적으로 사용자가 직접 연결 메서드를 호출할 필요가 없습니다. 저수준 `SOOPChatClient`를 직접 사용하는 경우에만 아래 메서드를 사용합니다. `connectToChat()`이 반환하는 `CompletableFuture`는 v0.5.0부터 연결이 **해제**될 때 완료됩니다.
+`SOOPClient.add()`는 등록과 동시에 비동기 연결을 시작하므로 일반적으로 사용자가 직접 연결 메서드를 호출할 필요가 없습니다. 저수준 `SOOPChatClient`를 직접 사용하는 경우에만 아래 메서드를 사용합니다.
+
+`connectToChat()`은 **세션**을 시작합니다. 반환된 `CompletableFuture`는 세션이 **끝날 때** 완료됩니다. `disconnect()`나 서버의 연결 종료로 끝나면 정상 완료, 연결 실패나 재시도 소진으로 끝나면 `ConnectionException`으로 예외 완료됩니다. 연결됐는지는 `JOIN_CHANNEL` 이벤트나 `isConnected()`로 확인하세요.
 
 | 메서드 | 동작 |
 |--------|------|
-| `SOOPClient.add(streamerId)` | 등록 + **즉시 비동기 연결**. 이미 등록된 bid면 기존 인스턴스 반환(필요 시 자동 재연결). |
-| `SOOPClient.connectAll()` | 등록된 모든 클라이언트의 disconnect를 대기하는 `CompletableFuture<Void>` 반환. |
-| `SOOPClient.reconnect(streamerId)` | tear-down + 새 연결로 **강제 재연결**. 현재 상태/backoff 무시. `RECONNECTING`→`DISCONNECTED`→`RECONNECTED` emit. |
-| `SOOPClient.reconnectAll()` | 등록된 모든 스트림에 대해 강제 재연결 수행 후 모두 disconnect될 때까지 대기. |
-| `SOOPClient.remove(streamerId)` | 개별 disconnect + 등록 해제. |
+| `SOOPClient.add(streamerId)` | 등록 + **즉시 비동기 연결**. 이미 등록된 bid면 기존 인스턴스 반환(세션이 끝난 인스턴스면 새 세션 시작). |
+| `SOOPClient.connectAll()` | 등록된 모든 세션이 끝날 때 완료되는 future. 끝난 세션은 새로 시작하며, 하나라도 실패로 끝나면 예외로 완료. |
+| `SOOPClient.reconnect(streamerId)` | 방송 정보 조회부터 새 연결로 **강제 재연결**. 현재 상태/backoff 무시. 세션은 유지되며 `RECONNECTING`→`RECONNECTED`만 emit(`DISCONNECTED` 없음). 새 연결이 실패하면 세션이 `DISCONNECTED(causedByError=true)`로 끝남. |
+| `SOOPClient.reconnectAll()` | 등록된 모든 스트림을 강제 재연결하고, 모든 세션이 끝날 때 완료되는 future 반환. |
+| `SOOPClient.remove(streamerId)` | 세션 종료 + 등록 해제. 제거된 클라이언트는 `DISCONNECTED` 리스너가 재연결을 시도해도 다시 연결되지 않음. 글로벌 리스너는 먼저 떼어 내므로 마지막 `DISCONNECTED`는 클라이언트에 직접 등록한 리스너에만 전달. |
 | `SOOPClient.close()` | 모든 클라이언트 종료 + HTTP 리소스 해제. `try-with-resources` 권장. |
-| `SOOPChatClient.connectToChat()` | (저수준) 연결 해제 시 완료되는 `CompletableFuture<Void>` 반환. Idempotent. |
+| `SOOPChatClient.connectToChat()` | (저수준) 세션 시작. 진행 중인 세션이 있으면 같은 future 반환. |
 | `SOOPChatClient.connectAndAwait()` | (저수준) `connectToChat().join()`의 편의 메서드 (블로킹). |
-| `SOOPChatClient.reconnect()` | (저수준) 현재 연결 위에서 가벼운 재연결. 초기 미연결 상태면 실패. |
-| `SOOPChatClient.forceReconnect()` | (저수준) 상태 무관하게 tear-down + 새 연결. `RECONNECTING`/`RECONNECTED` emit. |
-| `SOOPChatClient.connectToChattingBlocking()` | **Deprecated** — `connectAndAwait()` 사용 권장. |
+| `SOOPChatClient.disconnect()` | (저수준) 연결 중·재연결 대기 중을 포함해 어떤 상태에서도 세션 종료. 블로킹하지 않으며 `DISCONNECTED`는 비동기로 전달. 이후 새 세션 시작 가능. |
+| `SOOPChatClient.close()` | (저수준) 세션 종료 후 클라이언트를 닫음. 이후 `connectToChat()`·`forceReconnect()`는 실패. |
+| `SOOPChatClient.reconnect()` | (저수준) 방송 정보 재조회 없이 WebSocket만 다시 엶. 새 소켓이 채널에 입장하면 완료. 세션이 없으면 실패. |
+| `SOOPChatClient.forceReconnect()` | (저수준) 방송 정보 조회부터 새 연결. 세션 유지, `RECONNECTING(1/1)`→`RECONNECTED` emit, `DISCONNECTED` 없음(새 연결이 실패하면 세션 종료). 세션이 없으면 새로 시작. |
+
+### 끊김과 재연결
+
+- **서버가 연결을 닫으면**(Close 프레임) 세션이 끝납니다. `DISCONNECTED`(`causedByError=false`)가 발생하며 자동으로 다시 연결하지 않습니다.
+- **네트워크 오류·비정상 종료(1006)·송신/핑 실패·채널 입장 응답 없음**이면 backoff(2초부터 두 배씩, 최대 30초)로 자동 재연결하며 `RECONNECTING`→`RECONNECTED`가 발생합니다. `maxRetryAttempts`를 다 쓰면 `DISCONNECTED`(`causedByError=true`)와 함께 세션 future가 예외로 완료됩니다.
+- **연결됨**(`isConnected()`, `RECONNECTED`)은 서버가 채널 입장(JOIN)에 응답한 시점입니다. 서버는 같은 클라이언트가 방금 나간 채널에 곧바로 다시 들어오는 요청을 몇 초간 무시할 수 있어, 응답이 올 때까지 입장 요청을 1초마다 다시 보냅니다. 그래서 `forceReconnect()` 직후 재입장까지 1~3초가 걸릴 수 있습니다.
+
+### 이벤트 전달 규칙
+
+- 이벤트는 스트림마다 **도착 순서대로 한 번에 하나씩** 전달됩니다. 리스너가 느리면 그 스트림의 이벤트만 늦어집니다.
+- `DISCONNECTED`는 세션마다 **정확히 한 번** 발생하고, 그 뒤로는 해당 세션의 이벤트가 오지 않습니다. 직접 끝낸 경우는 `isClientInitiated()`로 구분합니다.
+- 리스너 안에서 세션 future(`connectToChat()`, `connectAndAwait()`, `forceReconnect()`)를 기다리면 교착 상태가 됩니다. 송신 결과(`sendChat(..).join()`)나 `reconnect().join()`은 기다려도 됩니다.
 
 ## 이벤트 타입
 
@@ -328,7 +359,7 @@ SOOPChatConfig config = new SOOPChatConfig.Builder()
 | `BJ_NOTICE` | 104 | `BjNoticeEvent` | `show` (1=표시), `message` (공지 내용) |
 | `VIDEO_BALLOON` | 105 | `VideoBalloonEvent` | `bjId`, `userId`, `userNickname`, `balloonCount`, `fanOrder`, `isDefault`, `extraData` |
 | `SEND_SUBSCRIPTION` | 108 | `SendSubscriptionEvent` | `senderId`, `senderNickname`, `receiverId`, `receiverNickname`, `itemType`, `itemCode`, `subscriptionType` |
-| `OGQ_EMOTICON` | 109 | `OGQEmoticonEvent` | `chatNo`, `groupId`, `subId`, `version`, `userInfo`, `color` |
+| `OGQ_EMOTICON` | 109 | `OGQEmoticonEvent` | `chatNo`, `groupId`, `subId`, `version`, `senderId()`, `senderNickname()` (옛 이름 `userInfo`, `color`) |
 | `EMOTICON_TICKET` | 110 | `EmoticonTicketEvent` | `value` (채널 입장 직후 수신, 보통 1) |
 | `ITEM_DROPS` | 111 | `ItemDropsEvent` | `bjId`, `dropsName`, `dropsMsg`, `dropsImgUrl` |
 | `OGQ_EMOTICON_GIFT` | 118 | `GiftOGQEmoticonEvent` | `senderId`, `senderNick`, `receivedId`, `receivedNick`, `ogqTitle`, `ogqImageUrl` |
@@ -341,11 +372,11 @@ SOOPChatConfig config = new SOOPChatConfig.Builder()
 
 | 이벤트 | 코드 | Record 타입 | 주요 필드 |
 |--------|------|-------------|-----------|
-| `DISCONNECTED` | -3 | `DisconnectedEvent` | `statusCode`, `reason`, `causedByError` |
+| `DISCONNECTED` | -3 | `DisconnectedEvent` | `statusCode`, `reason`, `causedByError`, `isClientInitiated()` |
 | `RECONNECTING` | -4 | `ReconnectingEvent` | `attemptNumber`, `maxAttempts`, `delayMs` |
 | `RECONNECTED` | -5 | `ReconnectedEvent` | `totalAttempts` |
 
-전체 93개 이벤트 타입은 `ChatEvent.java`를, 모든 Record 필드 상세는 `llms-full.txt`를 참조하세요.
+전체 이벤트(서버 이벤트 92개 + 클라이언트 이벤트 `RAW`·`DISCONNECTED`·`RECONNECTING`·`RECONNECTED`·`NONE_TYPE`)는 `ChatEvent.java`를, 모든 Record 필드 상세는 `llms-full.txt`를 참조하세요. 알 수 없는 서비스 코드는 `NONE_TYPE`(`NoneTypeEvent`)으로 전달되며, 원래 코드는 `raw()`의 헤더에 남아 있습니다.
 
 ## 코드표 (Code Tables)
 
@@ -353,22 +384,22 @@ SOOP 소켓 프로토콜이 숫자로 전달하는 값(사용자 등급, 아이�
 
 | 코드표 | 타입 | 지연 접근자 |
 |--------|------|-------------|
-| 사용자 등급 | `UserLevel` (`UserFlag` 주 + `UserFlag2` 보조) | `ChatMessageEvent.senderLevel()`, `ChatUserEntry.level()`, `AdminChatUserEntry.level()`, `LoginEvent.userLevel()`, `JoinChannelEvent.userLevel()`, `SetUserFlagEvent.oldLevel()`/`newLevel()`, `SetAdminFlagEvent.level()` |
-| 아이스(채팅 제한) 모드 | `ChatIceType` (+ `ChatIceType.Flag`) | `IceModeEvent`·`IceModeExEvent`·`GetIceModeRelayEvent` 의 `iceType()`, `iceFlags()`, `isIceFlagMode()` |
+| 사용자 등급 | `UserLevel` (`UserFlag` 주 + `UserFlag2` 보조) | `ChatMessageEvent.senderLevel()`, `ManagerChatEvent.senderLevel()`, `ChatUserEntry.level()`, `AdminChatUserEntry.level()`, `LoginEvent.userLevel()`, `JoinChannelEvent.userLevel()`, `SetUserFlagEvent.oldLevel()`/`newLevel()`, `SetAdminFlagEvent.level()`, `SetNicknameEvent.level()`, `SetSubBjEvent.level()` |
+| 아이스(채팅 제한) 모드 | `ChatIceType` (+ `ChatIceType.Flag`) | `IceModeEvent`·`IceModeExEvent`·`GetIceModeRelayEvent` 의 `iceType()`, `iceFlags()`, `isIceFlagMode()`. 그룹 비트마스크가 `freezeType`에 오는 `IceModeExEvent`·`GetIceModeRelayEvent`는 `freezeFlags()` |
 | 채널 퇴장 사유 | `ChatQuitStatus` | `QuitChannelEvent.quitStatus()` |
 
 ```java
-client.on(ChatEvent.CHAT_MESSAGE, (bid, ChatMessageEvent e) -> {
+client.on(ChatEvent.CHAT_MESSAGE, (String bid, ChatMessageEvent e) -> {
     UserLevel level = e.senderLevel();          // "81952|32768" → 파싱
     if (level.has(UserFlag.BJ)) { /* 방송인 */ }
     if (level.has(UserFlag2.TOPCLAN)) { /* 보조 그룹 플래그 */ }
 });
 
-client.on(ChatEvent.QUIT_CHANNEL, (bid, QuitChannelEvent e) -> {
+client.on(ChatEvent.QUIT_CHANNEL, (String bid, QuitChannelEvent e) -> {
     if (e.quitStatus() == ChatQuitStatus.ADMKICK) { /* 운영자 강제 퇴장 */ }
 });
 
-client.on(ChatEvent.ICE_MODE, (bid, IceModeEvent e) -> {
+client.on(ChatEvent.ICE_MODE, (String bid, IceModeEvent e) -> {
     if (e.isIceFlagMode()) {
         Set<ChatIceType.Flag> flags = e.iceFlags();   // v2 비트 플래그
     } else {
@@ -377,7 +408,7 @@ client.on(ChatEvent.ICE_MODE, (bid, IceModeEvent e) -> {
 });
 ```
 
-> 사용자 등급 플래그는 `"주|보조"` 형식의 문자열이며 두 정수는 서로 다른 비트 의미를 가집니다(예: `16`이 주 그룹에서는 `GUEST`, 보조 그룹에서는 `GAMEGOD`). 그래서 주 그룹은 `UserFlag`, 보조 그룹은 `UserFlag2`로 각각 분해합니다. 알 수 없는 코드는 센티넬(`UNKNOWN` / `UserLevel.EMPTY`)을 반환하며 예외를 던지지 않습니다.
+> 사용자 등급 플래그는 `"주|보조"` 형식의 문자열이며 두 정수는 서로 다른 비트 의미를 가집니다(예: `16`이 주 그룹에서는 `GUEST`, 보조 그룹에서는 `GAMEGOD`). 그래서 주 그룹은 `UserFlag`, 보조 그룹은 `UserFlag2`로 각각 분해합니다. 각 그룹은 부호 있는 표기와 부호 없는 32비트 표기(`"2147483648"`)를 모두 받고, 반환되는 집합은 수정할 수 없습니다. 알 수 없는 코드는 센티넬(`UNKNOWN` / `UserLevel.EMPTY`)을 반환하며 예외를 던지지 않습니다.
 
 ## AI 지원 문서
 

@@ -1,7 +1,7 @@
 # SOOPAPI - 비공식 SOOP 채팅 API
 
 > SOOP(한국 라이브 스트리밍 플랫폼) 채팅 시스템과 상호작용하기 위한 비공식 Java 25+ 라이브러리.
-> WebSocket 기반 실시간 채팅 연결, 93개 이상의 타입 안전한 이벤트 디코딩, 이벤트 기반 아키텍처를 제공합니다.
+> WebSocket 기반 실시간 채팅 연결, 92개 서버 이벤트의 타입 안전한 디코딩, 이벤트 기반 아키텍처를 제공합니다.
 
 이 문서는 **요점 정리**입니다. 전체 API 시그니처·이벤트별 필드·프로토콜·내부 구조 등 상세 레퍼런스는
 [llms-full.txt](llms-full.txt)에 있으며, 각 절 끝의 `→ llms-full.txt §...` 링크로 바로 이동할 수 있습니다.
@@ -22,7 +22,7 @@
 repositories { maven { url 'https://jitpack.io' } }
 
 dependencies {
-    implementation 'com.github.getCurrentThread:soopapi:v0.13.0' // 최신 버전은 핵심 정보 참조
+    implementation 'com.github.getCurrentThread:soopapi:v0.14.0' // 최신 버전은 핵심 정보 참조
 }
 ```
 
@@ -33,26 +33,26 @@ dependencies {
 ```java
 try (SOOPClient client = new SOOPClient()) {
     // 글로벌 리스너 — 이후 add()되는 모든 스트림에 자동 attach. 핸들러: (streamerId, event)
-    client.on(ChatEvent.CHAT_MESSAGE, (bid, ChatMessageEvent e) ->
+    client.on(ChatEvent.CHAT_MESSAGE, (String bid, ChatMessageEvent e) ->
             System.out.println("[" + bid + "] " + e.senderNickname() + ": " + e.message()));
-    client.on(ChatEvent.SEND_BALLOON, (bid, SendBalloonEvent e) ->
+    client.on(ChatEvent.SEND_BALLOON, (String bid, SendBalloonEvent e) ->
             System.out.println("[" + bid + "] " + e.senderNickname() + "님이 풍선 " + e.count() + "개!"));
 
     client.add("streamerA");    // 등록 즉시 비동기 연결, bid 기준 dedup
     client.add("streamerB");
-    client.connectAll().join(); // 모든 연결이 끊길 때까지 대기
+    client.connectAll().join(); // 모든 세션이 끝날 때까지 대기
 }
 ```
 
 - authCookie 없이 연결하면 **익명(읽기 전용)** 모드 — 수신은 되지만 `sendChat()`은 `AuthenticationException`.
-- 인증/전송: `client.auth().signIn(id, pw)` → `AuthCookie` → `SOOPChatConfig.Builder().authCookie(cookie)` → `sendChat(...)`.
+- 인증/전송: `client.auth().signIn(id, pw)` → `AuthCookie` → `SOOPChatConfig.Builder().authCookie(cookie)` → `JOIN_CHANNEL`을 받은 뒤 `sendChat(...)`(예: `chat.once(ChatEvent.JOIN_CHANNEL, e -> chat.sendChat("hi"))`). null·공백 메시지와 `U+000C`·`U+001B`가 든 메시지는 `IllegalArgumentException`.
 
 → 직접 연결 · 인증+전송 · 연결 상태 이벤트 · 에러 핸들링 예제: [llms-full.txt § 빠른 시작](llms-full.txt#빠른-시작)
 
 ## API 핵심
 
 **SOOPClient** (파사드, `AutoCloseable`) — 통합 진입점
-- `add(streamerId)` / `add(config)` → 등록 + 즉시 비동기 연결 (bid dedup, 자동 재연결)
+- `add(streamerId)` / `add(config)` → 등록 + 즉시 비동기 연결 (bid dedup, 세션이 끝난 인스턴스면 새 세션)
 - `remove(id)` · `get(id)` · `streamerIds()` · `clients()`
 - `on/off(ChatEvent, (streamerId, event) -> …)` → 글로벌 리스너 (모든 스트림 + 이후 추가분에 자동 attach)
 - `connectAll()` · `reconnect(id)` · `reconnectAll()` · `close()`
@@ -60,8 +60,8 @@ try (SOOPClient client = new SOOPClient()) {
 
 **SOOPChatClient** (단일 채팅 연결, `AutoCloseable`)
 - `on/once/off(ChatEvent, listener)` · `getEventEmitter()`
-- `connectToChat()` (연결 해제 시 완료) · `connectAndAwait()` (블로킹) · `disconnect()` · `reconnect()` · `forceReconnect()`
-- `sendChat(message)` (인증 필요) · `isConnected()` · `getConnectionStatus()` · `getBid()`
+- `connectToChat()` (세션이 끝날 때 완료) · `connectAndAwait()` (블로킹) · `disconnect()` (non-blocking) · `close()` (최종 종료) · `reconnect()` · `forceReconnect()`
+- `sendChat(message)` · `sendWhisper(targetId, message)` (인증 필요) · `isConnected()` · `getConnectionStatus()` · `getBid()`
 
 **HTTP API**: `SOOPAuth.signIn(id, pw)` → `AuthCookie` · `SOOPLive.detail(id[, bno[, cookie]])` → `LiveDetail` · `SOOPChannel.station(id)` → `StationInfo`
 
@@ -82,8 +82,8 @@ BaseEvent (sealed)
 └── UnknownEvent           알 수 없는 타입
 ```
 
-- 서비스 코드 `0`~`128` + 클라이언트 합성 이벤트(`-2` RAW, `-3` DISCONNECTED, `-4` RECONNECTING, `-5` RECONNECTED, `-1` NONE_TYPE).
-- `ChatEvent.fromCode(int)`는 미지의 코드에 대해 `NONE_TYPE`(센티넬)을 반환합니다.
+- 서비스 코드 `0`~`128`의 서버 이벤트 92개 + 클라이언트 합성 이벤트 5개(`-2` RAW, `-3` DISCONNECTED, `-4` RECONNECTING, `-5` RECONNECTED, `-1` NONE_TYPE).
+- `ChatEvent.fromCode(int)`는 미지의 코드에 대해 `NONE_TYPE`(센티넬)을 반환하고, 그런 패킷은 `NoneTypeEvent`로 전달됩니다(원래 코드는 `raw()` 헤더에 있음).
 - 자주 쓰는 이벤트:
 
 | 코드 | ChatEvent | Record | 설명 |
@@ -104,9 +104,9 @@ BaseEvent (sealed)
 
 `...soopapi.code` 패키지가 원시 코드/플래그를 타입으로 **지연 디코딩**합니다. 원시 필드(String/int)는 그대로 유지되고, 이벤트 record의 접근자가 **호출 시점에만** 파싱합니다. 알 수 없는 코드는 센티넬(`UNKNOWN` / `UserLevel.EMPTY`)을 반환하며 예외를 던지지 않습니다.
 
-- `UserLevel.parse("주|보조")` → `UserFlag`(주) · `UserFlag2`(보조) 집합. 두 그룹은 비트값이 겹쳐 enum을 분리(예: 16 = GUEST(주) vs GAMEGOD(보조)). 부호 비트(`NOTITOPFAN = 1<<31`)는 `(mask & bit) == bit`로 안전 처리.
-  - 접근자: `ChatMessageEvent.senderLevel()`, `LoginEvent.userLevel()`, `JoinChannelEvent.userLevel()`, `SetUserFlagEvent.oldLevel()/newLevel()`, `SetAdminFlagEvent.level()`, `ChatUserEntry.level()`, `AdminChatUserEntry.level()`.
-- `ChatIceType.fromCode(int)`(레거시 0~4) + `ChatIceType.Flag.fromMask(int)`(v2 비트). 접근자: `IceModeEvent`/`IceModeExEvent`/`GetIceModeRelayEvent`의 `iceType()`, `iceFlags()`, `isIceFlagMode()`.
+- `UserLevel.parse("주|보조")` → `UserFlag`(주) · `UserFlag2`(보조) 집합(수정 불가). 두 그룹은 비트값이 겹쳐 enum을 분리(예: 16 = GUEST(주) vs GAMEGOD(보조)). 각 그룹은 부호 있는/없는 32비트 표기를 모두 받고, 부호 비트(`NOTITOPFAN = 1<<31`)는 `(mask & bit) == bit`로 안전 처리.
+  - 접근자: `ChatMessageEvent.senderLevel()`, `ManagerChatEvent.senderLevel()`, `LoginEvent.userLevel()`, `JoinChannelEvent.userLevel()`, `SetUserFlagEvent.oldLevel()/newLevel()`, `SetAdminFlagEvent.level()`, `SetNicknameEvent.level()`, `SetSubBjEvent.level()`, `ChatUserEntry.level()`, `AdminChatUserEntry.level()`.
+- `ChatIceType.fromCode(int)`(레거시 0~4) + `ChatIceType.Flag.fromMask(int)`(v2 비트, 매핑 안 된 비트는 무시). 접근자: `IceModeEvent`/`IceModeExEvent`/`GetIceModeRelayEvent`의 `iceType()`, `iceFlags()`, `isIceFlagMode()`, 그리고 `freezeType`의 그룹 비트를 푸는 `IceModeExEvent`/`GetIceModeRelayEvent.freezeFlags()`.
 - `ChatQuitStatus.fromCode(int)`(0~6). 접근자: `QuitChannelEvent.quitStatus()`.
 
 → 플래그 비트값 · 접근자 전체 목록: [llms-full.txt § 코드표 및 플래그 해석](llms-full.txt#코드표-및-플래그-해석)
@@ -114,7 +114,11 @@ BaseEvent (sealed)
 ## 연결 라이프사이클 & 에러 처리
 
 - `SOOPClient.add()`는 등록과 동시에 비동기 연결을 시작하므로 별도 `connectToChat()`이 불필요합니다. 저수준 `SOOPChatClient`를 직접 쓸 때만 `connectToChat()`/`connectAndAwait()`를 사용합니다.
-- `connectToChat()`이 반환하는 `CompletableFuture`는 v0.5.0부터 연결이 해제될 때 완료됩니다.
+- `connectToChat()`은 세션을 시작하고, 반환된 future는 세션이 **끝날 때** 완료됩니다: `disconnect()`·서버 종료면 정상, 연결 실패·재시도 소진이면 `ConnectionException`. 진행 중이면 같은 future를 돌려줍니다.
+- 서버가 연결을 닫으면 세션 종료(자동 재연결 없음). 네트워크 오류·1006·송신/핑 실패·채널 입장 응답 없음은 backoff(2초→최대 30초) 자동 재연결(`RECONNECTING`→`RECONNECTED`), 소진 시 `DISCONNECTED(causedByError=true)`.
+- "연결됨"(`isConnected()`, `RECONNECTED`)은 서버가 채널 입장(JOIN)에 응답한 시점. 서버가 직후 재입장을 몇 초 무시할 수 있어 응답이 올 때까지 JOIN을 1초마다 다시 보냅니다.
+- `forceReconnect()`/`SOOPClient.reconnect(id)`는 세션을 유지하며 `RECONNECTING`→`RECONNECTED`만 emit(`DISCONNECTED` 없음. 새 연결이 실패하면 세션 종료). `disconnect()`는 어떤 상태에서도 세션을 끝내며 non-blocking, `close()`는 최종 종료.
+- 이벤트는 스트림마다 도착 순서대로 한 번에 하나씩 전달, `DISCONNECTED`는 세션마다 정확히 한 번(직접 끝낸 경우 `isClientInitiated()`). 리스너 안에서 세션 future를 기다리면 교착(송신 결과는 기다려도 됨).
 - 예외 계층: `SOOPChatException`(RuntimeException) ← `AuthenticationException` · `ConnectionException` · `EventEmitterException`(`getChatEvent()` 제공).
 
 → 상세: [llms-full.txt § connectToChat() 동작 방식](llms-full.txt#connecttochat-동작-방식) · [§ 에러 처리](llms-full.txt#에러-처리)
