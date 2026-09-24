@@ -45,6 +45,7 @@ try (SOOPClient client = new SOOPClient()) {
 ```
 
 - authCookie 없이 연결하면 **익명(읽기 전용)** 모드 — 수신은 되지만 `sendChat()`은 `AuthenticationException`.
+- 19금 방송은 익명으로 들어갈 수 없음 — 세션이 재시도 없이 `DISCONNECTED(causedByError=true)`로 끝나고 `connectToChat()`·`ready()`는 `ConnectionException`(원인 `AdultBroadcastException`). 연령 인증된 계정의 `authCookie`를 넘기면 `detail()`이 채팅 접속 정보를 받고 채팅에도 연결됨(실제 계정으로 확인). 19금을 여는 것은 로그인 쿠키이고 `confirm_adult`는 늘 false(19금 확인을 사용자 대신 하지 않음).
 - 인증/전송: `client.auth().signIn(id, pw)` → `AuthCookie` → `SOOPChatConfig.Builder().authCookie(cookie)` → `connectToChat()` 뒤 `ready()`가 완료되면 `sendChat(...)`(예: `chat.connectToChat(); chat.ready().thenRun(() -> chat.sendChat("hi"));`). 인증 연결의 ENTER_INFO는 `ready()` 완료 전에 송신 순서에 들어가므로 곧바로 보내도 그 뒤에 나갑니다. `JOIN_CHANNEL` 리스너에서 보내도 되지만 `JOIN_CHANNEL`은 재입장할 때마다 다시 발생합니다. null·공백 메시지와 `U+000C`·`U+001B`가 든 메시지는 `IllegalArgumentException`.
 
 → 직접 연결 · 인증+전송 · 연결 상태 이벤트 · 에러 핸들링 예제: [llms-full.txt § 빠른 시작](llms-full.txt#빠른-시작)
@@ -122,7 +123,7 @@ BaseEvent (sealed)
 - `ready()`: 이미 입장해 있으면 완료된 future, 연결 중·backoff 대기 중이면 다음 JOIN 응답에서 완료(`reconnect()`·`forceReconnect()`를 거쳐도 계속 대기). 그 전에 세션이 끝나면(disconnect·close·서버 종료·연결 실패·재시도 소진) `ConnectionException`, 세션이 없거나 `close()` 뒤면 `IllegalStateException`. 폴링하지 말고 받은 future 하나를 재사용합니다.
 - `forceReconnect()`/`SOOPClient.reconnect(id)`는 세션을 유지하며 `RECONNECTING`→`RECONNECTED`만 emit(`DISCONNECTED` 없음. 새 연결이 실패하면 세션 종료). `disconnect()`는 어떤 상태에서도 세션을 끝내며 non-blocking, `close()`는 최종 종료.
 - 이벤트는 스트림마다 도착 순서대로 한 번에 하나씩 전달, `DISCONNECTED`는 세션마다 정확히 한 번(직접 끝낸 경우 `isClientInitiated()`). 리스너 안에서 세션 future를 기다리면 교착(송신 결과·`reconnect()`·`ready()`는 lane 밖에서 완료되므로 기다려도 됨. 기다리는 동안 그 스트림의 이벤트 전달은 멈춤).
-- 예외 계층: `SOOPChatException`(RuntimeException) ← `AuthenticationException` · `ConnectionException` · `EventEmitterException`(`getChatEvent()` 제공).
+- 예외 계층: `SOOPChatException`(RuntimeException) ← `AuthenticationException`(← `AdultBroadcastException`) · `ConnectionException` · `EventEmitterException`(`getChatEvent()` 제공).
 
 → 상세: [llms-full.txt § connectToChat() 동작 방식](llms-full.txt#connecttochat-동작-방식) · [§ 에러 처리](llms-full.txt#에러-처리)
 

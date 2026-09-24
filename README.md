@@ -189,6 +189,9 @@ client.on(ChatEvent.CHAT_MESSAGE, (ChatMessageEvent e) -> {
 client.connectAndAwait(); // 채팅 수신 가능, 전송 불가
 ```
 
+> **19금 방송**: 서버가 19금 방송의 채팅 접속 정보를 익명 요청에 주지 않으므로 익명으로는 들어갈 수 없습니다. 세션은 재시도 없이 `DISCONNECTED(causedByError=true)`로 끝나고, `connectToChat()`·`ready()`는 `AdultBroadcastException`을 원인으로 둔 `ConnectionException`으로 실패합니다. 연령 인증된 계정으로 로그인해 그 `authCookie`를 넘기면 방송 정보 조회(`detail()`)가 19금 방송의 채팅 접속 정보를 받고 채팅에도 연결됩니다(실제 계정으로 확인). 19금 방송을 여는 것은 이 로그인 쿠키이고 19금 확인 값은 결과를 바꾸지 않으므로, 라이브러리는 19금 확인을 사용자 대신 하지 않고 늘 `confirm_adult=false`로 요청합니다.
+> 방송 목록의 `broad_grade`는 캐시된 값이라 지금의 19금 여부와 다를 수 있습니다. 조회 결과로 판단하세요.
+
 ### 인증 (채팅 전송 시 필수)
 
 읽기 전용(이벤트 수신)은 인증 없이 사용할 수 있지만, `sendChat()`으로 채팅을 전송하려면 반드시 인증이 필요합니다.
@@ -393,6 +396,8 @@ v0.14.0에서 올리는 경우 아래 변경을 확인하세요.
 - 알 수 없는 서비스 코드는 `NONE_TYPE`에 `UnknownEvent`(`code()` = 원래 서비스 코드)로 전달됩니다. `NoneTypeEvent`와 `NoneTypeDecoder`는 제거되었습니다.
 - `UnknownEvent`는 `SystemBaseEvent`가 아니라 `BaseEvent`를 직접 구현합니다. `NONE_TYPE` 리스너를 `SystemBaseEvent`로 받고 있었다면 `UnknownEvent`나 `BaseEvent`로 바꿉니다.
 - 새 API: `SOOPChatClient.ready()` ([연결 라이프사이클](#연결-라이프사이클) 참조).
+- 19금 방송 조회는 `SOOPChatException("API error: unknown error")` 대신 `AdultBroadcastException`(`AuthenticationException`의 하위 타입)으로 실패합니다. REASON 없이 실패한 다른 조회는 `"API error: RESULT=<코드>"`로 결과 코드를 알려 줍니다.
+- `LiveDetail.toString()`은 `ChannelInfo`처럼 FTK를 `<redacted>`로 가립니다.
 
 ```java
 chat.on(ChatEvent.NONE_TYPE, (UnknownEvent e) -> {

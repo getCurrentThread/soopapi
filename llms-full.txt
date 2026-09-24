@@ -85,6 +85,7 @@ client.connectAndAwait();
 ```
 
 authCookie 없이 연결하면 익명 모드로 동작합니다. 채팅 수신은 가능하지만 sendChat() 호출 시 AuthenticationException이 발생합니다.
+19금 방송은 익명으로 들어갈 수 없습니다. 서버가 채팅 접속 정보를 주지 않으므로, 세션은 재시도 없이 DISCONNECTED(causedByError=true)로 끝나고 connectToChat()·ready()는 AdultBroadcastException을 원인으로 둔 ConnectionException으로 실패합니다. 연령 인증된 계정으로 로그인한 authCookie를 넘기면 방송 정보 조회가 채팅 접속 정보를 받고 채팅에도 연결됩니다(실제 계정으로 확인). 19금 방송을 여는 것은 로그인 쿠키이며, 라이브러리는 19금 확인(confirm_adult)을 사용자 대신 하지 않고 늘 false로 요청합니다.
 SOOPChatClient 생성자는 네트워크 호출을 하지 않습니다. BNO를 설정하지 않았으면 connectToChat() 때 자동으로 조회합니다.
 
 ### 인증 + 채팅 전송
@@ -268,6 +269,8 @@ getInitialPacketDelayMs()도 같은 이유로 `@Deprecated(forRemoval = true)`�
 - signIn(String userId, String password) -> CompletableFuture<AuthCookie>
   - RESULT가 1이 아니면 AuthenticationException("Login failed: " + REASON). RESULT·REASON이 없거나 JSON null이면 기본값(0 / "unknown error")으로 처리
   - HTTP 200이 아니거나 응답을 파싱할 수 없으면 SOOPChatException
+  - 로그인 폼(szUid·szPassword), Set-Cookie 값, 응답 본문은 로그와 예외 메시지에 남기지 않음. 파싱할 수 없는 Set-Cookie 헤더는 예외 종류만 FINE으로 남기고 건너뜀. 응답이 JSON 객체가 아니면 본문 없이 실패(Gson의 "Not a JSON Object: <본문>" 메시지를 쓰지 않음). SOOPLive의 방송 정보 응답도 같음
+  - 로그인 응답 JSON에는 연령 인증 여부가 없으므로 19금 방송을 볼 수 있는 계정인지는 조회해 봐야 알 수 있음
 
 AuthCookie record 필드: userId, success, rawResponse, authTicket, abroadChk, abroadVod, bbsTicket, rdb, userTicket, au, au3rd, ausa, ausb
 - isAuthenticated() -> boolean - success이고 authTicket이 비어 있지 않으면 true
@@ -278,14 +281,16 @@ AuthCookie record 필드: userId, success, rawResponse, authTicket, abroadChk, a
 - getBno(String streamerId) -> CompletableFuture<String> - 방송 중이 아니면 SOOPChatException
 - detail(String streamerId) -> CompletableFuture<LiveDetail>
 - detail(String streamerId, String bno) -> CompletableFuture<LiveDetail>
-- detail(String streamerId, String bno, AuthCookie authCookie) -> CompletableFuture<LiveDetail> - 인증 쿠키로 조회(인증된 FTK를 받음)
+- detail(String streamerId, String bno, AuthCookie authCookie) -> CompletableFuture<LiveDetail> - 인증 쿠키로 조회(인증된 FTK를 받음). isAuthenticated()가 true인 쿠키면 로그인 쿠키(AuthTicket, _au, UserTicket, RDB)를 Cookie 헤더로 보내고, 아니면 익명으로 요청. 연령 인증된 계정의 로그인 쿠키면 19금 방송도 채팅 접속 정보가 옴(실제 계정으로 확인)
+- confirm_adult는 쿠키와 상관없이 늘 false. 19금 방송을 여는 것은 로그인 쿠키이고 confirm_adult는 결과를 바꾸지 않으므로(익명은 true여도 CHANNEL.RESULT -6, 연령 인증된 로그인은 false여도 1), 19금 확인을 사용자 대신 하지 않음
 - toChannelInfo(LiveDetail detail) -> ChannelInfo - WebSocket 연결 정보로 변환
 
 LiveDetail record 필드: bjId, bno, title, chatDomain, chatNo, ftk, chatPort, result, bps, geoCC, geoRC, acptLang, svcLang
 - chatDomain은 응답의 CHDOMAIN을 `Locale.ROOT`로 소문자화한 값(기본 Locale과 무관)
 - chatPort는 응답의 CHPT에 1을 더한 값
-- 필수 필드(BJID, TITLE, CHDOMAIN, CHATNO, FTK, CHPT)가 없거나 RESULT가 1이 아니면 SOOPChatException
-- ChannelInfo.toString()은 FTK를 `<redacted>`로 가림
+- 필수 필드(BJID, TITLE, CHDOMAIN, CHATNO, FTK, CHPT)가 없거나 RESULT가 1이 아니면 SOOPChatException. 메시지는 "API error: " + REASON이고, REASON이 없으면 "API error: RESULT=<코드>"
+- CHANNEL.RESULT가 -6이면 AdultBroadcastException: 19금 방송인데 볼 수 있는 로그인이 아닌 요청(익명, 연령 인증 없는 계정, 만료된 로그인). 이 응답에는 REASON과 채팅 접속 정보(BJID, CHDOMAIN, CHATNO, FTK, CHPT)가 없고 TITLE·BPS 같은 방송 정보만 옵니다. 메시지에 스트리머 ID가 들어가며, 익명 요청이면 연령 인증된 로그인의 AuthCookie를 넘기라고, 인증 요청이면 그 계정이 막혔다고 알려 줍니다
+- LiveDetail.toString()과 ChannelInfo.toString()은 FTK를 `<redacted>`(비어 있으면 `<empty>`)로 가림
 
 ### SOOPChannel (채널 정보)
 
@@ -378,6 +383,7 @@ connectToChat()은 **세션**을 시작합니다. 반환된 CompletableFuture는
 
 SOOPChatException (RuntimeException) - REST 응답 오류(HTTP 오류, 필수 필드 누락, 파싱 실패, station 누락 등)
 ├── AuthenticationException - 로그인 실패, 미인증 sendChat()/sendWhisper()
+│   └── AdultBroadcastException - 19금 방송을 볼 수 없는 요청(익명, 연령 인증 없는 계정, 만료된 로그인)의 방송 정보 조회
 ├── ConnectionException - 연결 실패(방송 정보 조회 실패, 채널 정보 오류, 재시도 소진). 세션 future와 ready()의 예외 원인
 └── EventEmitterException - 이벤트 리스너 예외 래핑
 
@@ -388,6 +394,7 @@ EventEmitterException 추가 메서드: getChatEvent() -> ChatEvent
 | 상황 | 결과 |
 |------|------|
 | 세션 연결 실패·재시도 소진 | DISCONNECTED(causedByError=true, statusCode=-1) 후 세션 future가 ConnectionException으로 예외 완료. connectAndAwait()는 ConnectionException을 던짐 |
+| 19금 방송에 익명(또는 볼 수 없는 계정)으로 연결 | 방송 정보 조회에서 실패해 재시도 없이 끝남. DISCONNECTED(causedByError=true, reason에 19금 안내) 1회, 세션 future와 ready()는 ConnectionException(원인 AdultBroadcastException)으로 예외 완료 |
 | 채널에 들어가기 전에 세션이 끝남(disconnect()·close()·서버 종료·연결 실패·재시도 소진) | 기다리던 ready()가 ConnectionException으로 예외 완료. 방송 정보 조회·검증에서 실패했으면 그 ConnectionException |
 | close()된 클라이언트의 connectToChat()/forceReconnect()/ready() | IllegalStateException("Client is closed")으로 실패한 future |
 | sendChat()/sendWhisper() 입력 오류 | IllegalArgumentException으로 실패한 future (소켓 영향 없음) |
@@ -458,6 +465,7 @@ lib/src/main/java/com/github/getcurrentthread/soopapi/
 ├── exception/                               # 예외
 │   ├── SOOPChatException.java               #   기본 예외 (RuntimeException)
 │   ├── AuthenticationException.java
+│   ├── AdultBroadcastException.java         #   19금 방송 조회 실패 (AuthenticationException 하위)
 │   ├── ConnectionException.java
 │   └── EventEmitterException.java
 ├── model/                                   # 도메인 모델
@@ -587,7 +595,7 @@ JDK WebSocket 수신 스레드
      e. 조회가 끝나면(성공·실패 무관) 조회용 HTTP 클라이언트를 바로 shutdown() (블로킹하지 않음). WebSocket 연결을 기다리지 않습니다.
   2. CHPT/CHDOMAIN 유효성 검증 (비어 있으면 ConnectionException)
   3. webSocketManager.connect(channelInfo) — 서버가 JOIN에 응답하면 완료 (소켓 단계 실패는 이 안에서 backoff 재시도)
-  - 조회·검증 단계(1~2)의 실패는 재시도하지 않고 곧바로 연결 실패입니다.
+  - 조회·검증 단계(1~2)의 실패는 재시도하지 않고 곧바로 연결 실패입니다. ConnectionException이 아닌 원인은 ConnectionException("Cannot connect to channel <bid>: <원인 메시지>", 원인)으로 감싸므로, 원인을 풀지 않아도 실패 메시지와 DISCONNECTED 사유에서 이유(예: 19금 안내)가 보입니다.
   - connect가 실패하면(close()로 중단된 경우 제외) 그 실패를 connectFailure로 기억하고 WebSocketManager를 닫습니다. 조회·검증에서 실패했으면 WebSocketManager는 시작한 적이 없으므로, 이렇게 닫아야 기다리던 ready()가 끝납니다.
 - ready(): WebSocketManager.ready()를 이어받아 실패를 ConnectionException으로 바꿉니다. connect가 실패했으면 WebSocketManager가 닫힌 이유 대신 그 실패(connectFailure, 예: 방송 정보 조회 실패)로 실패하며, 이후 호출도 같습니다.
 - terminated(): connect 결과가 정해진 뒤(settle) 정확히 한 번 완료. 성공했으면 WebSocketManager.terminated()를 이어받고, 실패했으면 ConnectionException으로 예외 완료(close()로 중단된 경우는 client-disconnect 이벤트로 정상 완료)
@@ -1436,13 +1444,14 @@ public sealed interface BaseEvent
 | 테스트 | 대상 | 유형 |
 |--------|------|------|
 | SOOPClientMultiConnectionTest | SOOPClient 다중 스트림: dedup, 글로벌 리스너 attach/detach, reconnect, 재시도 한도 전달, remove/close 뒤 재연결 차단 | 컴포넌트 |
-| api/JsonFieldsTest | JSON 필드 null-safe 헬퍼 | 단위 |
-| api/SOOPAuthTest | 로그인 응답의 JSON null RESULT/REASON 처리 | 단위 |
+| api/JsonFieldsTest | JSON 필드 null-safe 헬퍼, 객체가 아닌 본문은 본문 없이 실패(parseObject) | 단위 |
+| api/SOOPAuthTest | 로그인 응답의 JSON null RESULT/REASON 처리, 파싱할 수 없는 Set-Cookie 값·응답 본문·비밀번호가 로그와 예외에 남지 않음 | 단위 |
 | api/SOOPChannelTest | 방송국 중첩 JSON 파싱, station 누락 시 실패 | 단위 |
-| api/SOOPLiveTest | CHDOMAIN 소문자화(기본 Locale 무관) | 단위 |
+| api/SOOPLiveTest | CHDOMAIN 소문자화(기본 Locale 무관), RESULT -6→AdultBroadcastException(익명·인증·미인증 쿠키별 메시지), REASON 없는 실패의 RESULT 코드 표기, confirm_adult는 익명·미인증·인증 쿠키 모두 false(true를 보내면 실패), 로그인 Cookie 헤더는 인증 쿠키일 때만, 파싱할 수 없는 응답의 FTK·쿠키 값이 로그와 예외에 남지 않음 | 단위 |
 | api/model/AuthCookieTest | toString() 자격 증명 마스킹 | 단위 |
+| api/model/LiveDetailTest | toString() FTK 마스킹 | 단위 |
 | client/SOOPChatClientConcurrencyTest | 동시 connectToChat()이 같은 future 반환 | 컴포넌트 |
-| client/SOOPChatClientRealConnectionTest | 인기 방송 상위 10개에 실제 접속해 모니터링, 입장한 스트림과 forceReconnect 뒤의 ready() 완료 | 통합 (@Tag) |
+| client/SOOPChatClientRealConnectionTest | 인기 방송 상위 10개(19금 제외)에 실제 접속해 모니터링, 입장한 스트림과 forceReconnect 뒤의 ready() 완료. 익명 조회가 실제로 19금으로 막히는 방송 하나에 익명 연결해 AdultBroadcastException·DISCONNECTED 1회·재시도 없음 확인(없으면 skipped). SOOP_TEST_ID·SOOP_TEST_PW(연령 인증된 테스트 계정)가 있으면 익명 조회가 19금으로 막히는 방송 하나를 로그인 쿠키로 detail() 조회하고 채팅에 연결해 ready() 완료·JOIN_CHANNEL·userId가 있는 LOGIN·RECONNECTING 0·disconnect() 뒤 DISCONNECTED 1회(클라이언트가 끊음) 확인, 채팅은 보내지 않고 로그 파일에 비밀번호·쿠키·FTK가 없는지도 확인(환경 변수가 없거나 그런 방송이 없으면 skipped, 방송은 로그인 전에 찾음). test-logs/normal.log는 INFO 미만을 이 라이브러리 로거의 것만 남김 | 통합 (@Tag) |
 | client/SOOPChatClientSessionTest | 세션 수명주기: DISCONNECTED 한 번, forceReconnect, 연결 중 disconnect, close 뒤 차단. ready(): 세션 없음·close 뒤 실패, lane 밖 완료, 복구·forceReconnect를 지나 대기, 세션 종료 시 실패, 리스너 안에서 대기, 반복 호출이 연결에 쌓이지 않음 | 컴포넌트 |
 | client/SOOPChatClientTest | 송신 검증 순서, 생성자 검증 (실서버 연결 메서드 1개는 @Tag) | 단위 + 통합 |
 | code/ChatIceTypeTest | 아이스 모드 코드·v2 비트 | 단위 |
@@ -1453,7 +1462,7 @@ public sealed interface BaseEvent
 | code/UserLevelTest | "주|보조" 파싱, 부호 없는 마스크, 수정 불가 집합 | 단위 |
 | config/SOOPChatConfigTest | 채팅 설정 빌더 검증(0 타임아웃 거부, deprecated 설정) | 단위 |
 | config/SOOPClientConfigTest | 전역 설정 빌더 검증 | 단위 |
-| connection/SOOPConnectionTest | 방송 정보 조회를 주입해 WebSocket을 열기 전에 끝나는 연결의 ready() 실패: 조회 실패, 잘못된 채널 정보, 조회 중 close | 컴포넌트 |
+| connection/SOOPConnectionTest | 방송 정보 조회를 주입해 WebSocket을 열기 전에 끝나는 연결의 ready() 실패: 조회 실패, 잘못된 채널 정보, 조회 중 close. 19금 조회 실패가 connect()·ready()·terminated()와 클라이언트 세션(DISCONNECTED 1회)까지 원인을 유지하고 재시도하지 않음 | 컴포넌트 |
 | decoder/factory/DefaultMessageDecoderFactoryTest | 서버 이벤트 92개의 디코더 등록(등록 키가 정확히 서버 이벤트, NONE_TYPE 없음), eventType()==등록 키, 미지 코드→UnknownEvent(원래 코드) | 단위 |
 | decoder/FixtureDecoderDetailTest | 합성 패킷 30종의 모든 필드 값과 파생 접근자 | 단위 |
 | decoder/MessageDispatcherTest | 라우팅, RAW, 헤더 검증, 디코더 없는 코드→NONE_TYPE만, deactivate, lane 순서 | 컴포넌트 |
@@ -1475,7 +1484,8 @@ public sealed interface BaseEvent
 - websocket/FakeWebSocket — JDK처럼 미완료 송신 중 다음 송신이 오면 IllegalStateException("Send pending")으로 실패하고, JOIN 송신이 끝나면 JOIN 응답을 돌려주며, 서버 쪽 수신·닫힘·오류를 흉내 냄(WebSocketManager의 package-private Opener로 주입)
 - connection/FakeChatConnection, connection/FakeConnectionFactory — 네트워크 없는 ChatConnection과 그 팩토리(만든 연결을 기억). establish()·drop()·fail()·serverClose()로 입장·끊김·실패·서버 종료와 ready() 게이트를 흉내 냄
 - decoder/SyntheticPackets — 이벤트 타입별 합성 raw 패킷 30개(서버 형식, 모든 값은 placeholder). FixtureDecoderDetailTest·RawPacketFixtureTest가 사용
-- api/StubHttpResponse — API 파싱 테스트용 고정 응답
+- api/StubHttpResponse — API 파싱 테스트용 고정 응답(헤더는 선택)
+- api/LogCapture — 한 클래스의 로거 기록을 모든 레벨로 모으는 헬퍼. 자격 증명이 로그에 남지 않는지 확인할 때 씀
 - DataCollector — 실방송 패킷 수집 도구(collectFixtures 태스크). 저장한 .bin은 로컬 분석용이며 테스트는 읽지 않음
 
 ### 테스트 실행
@@ -1485,7 +1495,16 @@ public sealed interface BaseEvent
 ./gradlew :lib:build                                  # 위 테스트 + spotlessCheck 포함 빌드 (CI와 동일)
 ./gradlew :lib:test -PincludeTags=integration         # 통합 테스트만 (실서버 접속)
 ./gradlew :lib:test -PincludeTags=integration --tests '*RealConnectionTest*'
+
+# 19금 로그인 테스트. 연령 인증된 테스트 계정이 있어야 돌고, 없으면 skipped
+export SOOP_TEST_ID=<테스트 계정 ID>
+read -rs SOOP_TEST_PW && export SOOP_TEST_PW   # 비밀번호가 셸 기록에 남지 않게 입력
+./gradlew :lib:test -PincludeTags=integration --rerun --tests '*RealConnectionTest.testAdultBroadcastWithAgeVerifiedLogin'
 ```
+
+- testAdultBroadcastWithAgeVerifiedLogin은 SOOP_TEST_ID·SOOP_TEST_PW가 둘 다 있고 비어 있지 않을 때만 돕니다(@EnabledIfEnvironmentVariable). 하나라도 없으면 JUnit이 skipped로 보고합니다. 익명 조회가 19금으로 막히는 방송이 지금 없을 때도 로그인하지 않고 skipped입니다.
+- `--rerun`을 빼지 마세요. Gradle은 환경 변수를 test 태스크의 입력으로 보지 않으므로, 같은 명령을 환경 변수 없이 한 번 돌린 뒤에는 변수를 넣어도 `:lib:test UP-TO-DATE`로 테스트를 돌리지 않고 성공으로 끝납니다.
+- 이 테스트는 읽기 전용입니다. 로그인하고 19금 방송을 조회·연결할 뿐 채팅·귓말은 보내지 않습니다. 계정 ID·비밀번호·쿠키·LOGIN의 userId·채팅 본문은 로그(lib/test-logs)와 실패 메시지에 남기지 않고 개수와 참·거짓만 남기며, 끝에 로그 파일에 비밀번호·쿠키·FTK가 없는지 확인합니다.
 
 ### 테스트 규약
 
