@@ -5,6 +5,8 @@ import static org.junit.jupiter.api.Assertions.*;
 import java.net.http.WebSocket;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -17,8 +19,21 @@ import com.github.getcurrentthread.soopapi.decoder.MessageDispatcher;
 import com.github.getcurrentthread.soopapi.event.ChatEvent;
 import com.github.getcurrentthread.soopapi.event.EventEmitter;
 import com.github.getcurrentthread.soopapi.event.model.RawEvent;
+import com.github.getcurrentthread.soopapi.util.SerialExecutor;
 
 public class WebSocketListenerBufferTest {
+
+    private static final WebSocketListener.Callbacks NO_CALLBACKS =
+            new WebSocketListener.Callbacks() {
+                @Override
+                public void onInbound() {}
+
+                @Override
+                public void onClosed(int statusCode, String reason) {}
+
+                @Override
+                public void onFailed(Throwable error) {}
+            };
 
     private EventEmitter emitter;
     private WebSocketListener listener;
@@ -28,7 +43,7 @@ public class WebSocketListenerBufferTest {
     void setup() {
         emitter = new EventEmitter();
         var dispatcher = new MessageDispatcher(Map.of(), Runnable::run, emitter);
-        listener = new WebSocketListener(dispatcher, emitter);
+        listener = new WebSocketListener(dispatcher, null, NO_CALLBACKS);
         stubWebSocket = new StubWebSocket();
     }
 
@@ -159,6 +174,43 @@ public class WebSocketListenerBufferTest {
         listener.onBinary(ws, ByteBuffer.wrap(new byte[] {'x'}), true);
 
         assertEquals(2, ws.requested);
+    }
+
+    @Test
+    void detachedListener_dropsDataButKeepsReading() {
+        AtomicReference<String> received = new AtomicReference<>();
+        emitter.on(ChatEvent.RAW, (RawEvent e) -> received.set(e.raw()));
+        CountingWebSocket ws = new CountingWebSocket();
+
+        listener.detach();
+        listener.onText(ws, "after detach", true);
+
+        assertNull(received.get());
+        assertEquals(1, ws.requested, "A detached listener still requests frames");
+    }
+
+    @Test
+    void backloggedLane_pausesReadsUntilItDrains() {
+        List<Runnable> pool = new ArrayList<>();
+        SerialExecutor lane = new SerialExecutor(pool::add);
+        var dispatcher = new MessageDispatcher(Map.of(), lane, emitter);
+        var paced = new WebSocketListener(dispatcher, lane, NO_CALLBACKS);
+        CountingWebSocket ws = new CountingWebSocket();
+
+        for (int i = 0; i <= WebSocketListener.HIGH_WATER; i++) {
+            paced.onText(ws, "m" + i, true);
+        }
+        long requestedWhileBacklogged = ws.requested;
+        assertEquals(
+                WebSocketListener.HIGH_WATER,
+                requestedWhileBacklogged,
+                "The frame that crosses the high-water mark must not request the next one");
+
+        while (!pool.isEmpty()) {
+            pool.removeFirst().run(); // drain은 배치마다 스스로를 다시 제출한다
+        }
+
+        assertEquals(requestedWhileBacklogged + 1, ws.requested, "Reads resume after draining");
     }
 
     /** request() 호출 추적 외에는 아무 동작도 하지 않는 최소한의 WebSocket 스텁. */

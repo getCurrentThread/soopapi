@@ -14,13 +14,13 @@ import com.github.getcurrentthread.soopapi.decoder.factory.DefaultMessageDecoder
 import com.github.getcurrentthread.soopapi.decoder.message.IMessageDecoder;
 import com.github.getcurrentthread.soopapi.event.ChatEvent;
 import com.github.getcurrentthread.soopapi.event.EventEmitter;
+import com.github.getcurrentthread.soopapi.event.model.DisconnectedEvent;
 import com.github.getcurrentthread.soopapi.event.model.JoinChannelEvent;
 import com.github.getcurrentthread.soopapi.exception.ConnectionException;
 import com.github.getcurrentthread.soopapi.model.ChannelInfo;
 import com.github.getcurrentthread.soopapi.model.ConnectionStatus;
 import com.github.getcurrentthread.soopapi.util.SOOPChatUtils;
 import com.github.getcurrentthread.soopapi.util.SerialExecutor;
-import com.github.getcurrentthread.soopapi.websocket.WebSocketListener;
 import com.github.getcurrentthread.soopapi.websocket.WebSocketManager;
 
 public class SOOPConnection implements AutoCloseable {
@@ -38,7 +38,6 @@ public class SOOPConnection implements AutoCloseable {
 
     private volatile ChannelInfo channelInfo;
     private volatile boolean isConnected;
-    private volatile boolean isReconnecting;
 
     public SOOPConnection(
             SOOPChatConfig config,
@@ -50,17 +49,32 @@ public class SOOPConnection implements AutoCloseable {
         this.httpClient = new SOOPHttpClient(config.getConnectionTimeout());
         this.soopLive = new SOOPLive(httpClient);
 
-        // 연결마다 lane 하나: 이벤트가 도착 순서대로, 겹치지 않게 전달된다.
-        this.messageDispatcher =
-                new MessageDispatcher(
-                        SHARED_DECODERS, new SerialExecutor(messageProcessor), eventEmitter);
-
-        WebSocketListener listener = new WebSocketListener(messageDispatcher, eventEmitter);
+        // 연결마다 lane 하나: 데이터와 수명주기 이벤트가 도착 순서대로, 겹치지 않게 전달된다.
+        SerialExecutor lane = new SerialExecutor(messageProcessor);
+        this.messageDispatcher = new MessageDispatcher(SHARED_DECODERS, lane, eventEmitter);
         this.webSocketManager =
-                new WebSocketManager(
-                        config, config.getSSLContext(), scheduler, listener, eventEmitter);
+                new WebSocketManager(config, scheduler, lane, messageDispatcher, eventEmitter);
 
         registerEnterInfoHandler(eventEmitter);
+
+        // 경과 조치: SOOPChatClient가 아직 once(DISCONNECTED)로 세션 종료를 감지하므로 종료를 이벤트로 바꿔 준다.
+        webSocketManager
+                .terminated()
+                .whenCompleteAsync(
+                        (event, error) -> {
+                            isConnected = false;
+                            eventEmitter.emit(
+                                    ChatEvent.DISCONNECTED,
+                                    event != null ? event : errorEvent(error));
+                        },
+                        lane);
+    }
+
+    private static DisconnectedEvent errorEvent(Throwable error) {
+        Throwable cause = SOOPChatUtils.unwrapCompletionException(error);
+        String message = cause.getMessage() != null ? cause.getMessage() : cause.toString();
+        return new DisconnectedEvent(
+                -1, message, true, ChatEvent.DISCONNECTED, "", System.currentTimeMillis());
     }
 
     private void registerEnterInfoHandler(EventEmitter eventEmitter) {
@@ -154,59 +168,21 @@ public class SOOPConnection implements AutoCloseable {
     }
 
     public CompletableFuture<Void> reconnect() {
-        return CompletableFuture.runAsync(
-                () -> {
-                    CompletableFuture<Void> existing = null;
-                    connectionLock.lock();
-                    try {
-                        if (isReconnecting) {
-                            LOGGER.fine("Already reconnecting.");
-                            existing = webSocketManager.getReconnectFuture();
-                        } else {
-                            isReconnecting = true;
-                        }
-                    } finally {
-                        connectionLock.unlock();
-                    }
-
-                    if (existing != null) {
-                        try {
-                            existing.join();
-                        } catch (Exception e) {
-                            LOGGER.log(Level.WARNING, "Error waiting for reconnect", e);
-                            throw new CompletionException(e);
-                        }
-                        return;
-                    }
-
-                    try {
-                        LOGGER.fine("Attempting reconnect...");
-                        webSocketManager.reconnect().join();
-
-                        connectionLock.lock();
-                        try {
-                            isConnected = true;
-                        } finally {
-                            connectionLock.unlock();
-                        }
-                    } catch (Exception e) {
-                        LOGGER.log(Level.SEVERE, "Reconnect failed", e);
-                        Throwable cause = SOOPChatUtils.unwrapCompletionException(e);
-                        if (cause instanceof ConnectionException ce) {
-                            throw new CompletionException(ce);
-                        }
-                        throw new CompletionException(
-                                new ConnectionException("Failed to reconnect", cause));
-                    } finally {
-                        connectionLock.lock();
-                        try {
-                            isReconnecting = false;
-                        } finally {
-                            connectionLock.unlock();
-                        }
-                    }
-                },
-                executor);
+        return webSocketManager
+                .reconnect()
+                .handle(
+                        (unused, error) -> {
+                            if (error == null) {
+                                isConnected = true;
+                                return null;
+                            }
+                            Throwable cause = SOOPChatUtils.unwrapCompletionException(error);
+                            throw new CompletionException(
+                                    cause instanceof ConnectionException
+                                            ? cause
+                                            : new ConnectionException(
+                                                    "Failed to reconnect", cause));
+                        });
     }
 
     public CompletableFuture<Void> sendChat(String message) {
@@ -222,7 +198,7 @@ public class SOOPConnection implements AutoCloseable {
         connectionLock.lock();
         try {
             try {
-                webSocketManager.disconnect();
+                webSocketManager.close();
             } finally {
                 isConnected = false;
             }
@@ -254,7 +230,7 @@ public class SOOPConnection implements AutoCloseable {
                         wsStatus ->
                                 new ConnectionStatus(
                                         wsStatus.connected(),
-                                        isReconnecting,
+                                        wsStatus.reconnecting(),
                                         wsStatus.retryCount()));
     }
 
@@ -268,7 +244,7 @@ public class SOOPConnection implements AutoCloseable {
     }
 
     public boolean isReconnecting() {
-        return isReconnecting;
+        return webSocketManager.getStatus().join().reconnecting();
     }
 
     public ChannelInfo getChannelInfo() {
