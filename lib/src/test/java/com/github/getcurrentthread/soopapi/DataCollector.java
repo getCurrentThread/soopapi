@@ -140,6 +140,9 @@ public class DataCollector {
      * FIXTURES_DIR}/{TYPE_NAME}.bin 파일로 저장합니다.
      *
      * <p>반드시 {@code lib/} 디렉터리를 기준으로 실행해야 합니다.
+     *
+     * <p>저장된 파일은 로컬 분석용이며 단위 테스트는 읽지 않습니다. 새 패킷 형식을 확인하면 값을 합성 placeholder로 바꿔 {@code
+     * decoder/SyntheticPackets}에 옮겨 적습니다.
      */
     private static void collectFixtures() throws Exception {
         int streamerCount = 100;
