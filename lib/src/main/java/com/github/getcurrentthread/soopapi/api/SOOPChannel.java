@@ -34,41 +34,47 @@ public class SOOPChannel {
                                         "Failed to retrieve station info. Status code: "
                                                 + response.statusCode());
                             }
-
-                            try {
-                                JsonObject json =
-                                        JsonParser.parseString(response.body()).getAsJsonObject();
-
-                                return new StationInfo(
-                                        getString(json, "user_id", streamerId),
-                                        getString(json, "user_nick", ""),
-                                        getLong(json, "station_no", 0),
-                                        getString(json, "station_name", ""),
-                                        getString(json, "station_title", ""),
-                                        getInt(json, "is_live", 0) == 1,
-                                        getInt(json, "total_followers", 0));
-                            } catch (Exception e) {
-                                LOGGER.log(Level.WARNING, "Error parsing station info", e);
-                                throw new SOOPChatException("Failed to parse station info", e);
-                            }
+                            return parseStation(response.body(), streamerId);
                         });
     }
 
-    private static String getString(JsonObject json, String key, String defaultValue) {
-        return json.has(key) && !json.get(key).isJsonNull()
-                ? json.get(key).getAsString()
-                : defaultValue;
+    /**
+     * 방송국 API 응답 본문을 {@link StationInfo}로 변환한다.
+     *
+     * <p>방송국 필드는 {@code station} 객체 아래에, 팬 수는 {@code station.upd.fan_cnt}에 있다. 루트의 {@code broad}가
+     * JSON 객체이면 방송 중으로 본다.
+     *
+     * @throws SOOPChatException {@code station} 객체가 없거나 본문을 파싱할 수 없을 때
+     */
+    static StationInfo parseStation(String body, String streamerId) {
+        try {
+            JsonObject root = JsonParser.parseString(body).getAsJsonObject();
+
+            JsonObject station = childObject(root, "station");
+            if (station == null) {
+                throw new SOOPChatException("Station info missing in response");
+            }
+
+            JsonObject upd = childObject(station, "upd");
+            boolean isLive = childObject(root, "broad") != null;
+
+            return new StationInfo(
+                    JsonFields.getString(station, "user_id", streamerId),
+                    JsonFields.getString(station, "user_nick", ""),
+                    JsonFields.getLong(station, "station_no", 0),
+                    JsonFields.getString(station, "station_name", ""),
+                    JsonFields.getString(station, "station_title", ""),
+                    isLive,
+                    upd != null ? JsonFields.getInt(upd, "fan_cnt", 0) : 0);
+        } catch (SOOPChatException e) {
+            throw e;
+        } catch (Exception e) {
+            LOGGER.log(Level.WARNING, "Error parsing station info", e);
+            throw new SOOPChatException("Failed to parse station info", e);
+        }
     }
 
-    private static int getInt(JsonObject json, String key, int defaultValue) {
-        return json.has(key) && !json.get(key).isJsonNull()
-                ? json.get(key).getAsInt()
-                : defaultValue;
-    }
-
-    private static long getLong(JsonObject json, String key, long defaultValue) {
-        return json.has(key) && !json.get(key).isJsonNull()
-                ? json.get(key).getAsLong()
-                : defaultValue;
+    private static JsonObject childObject(JsonObject json, String key) {
+        return json.has(key) && json.get(key).isJsonObject() ? json.getAsJsonObject(key) : null;
     }
 }

@@ -2,6 +2,7 @@ package com.github.getcurrentthread.soopapi.api;
 
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.util.Locale;
 import java.util.concurrent.CompletableFuture;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -97,9 +98,9 @@ public class SOOPLive {
             JsonObject json = JsonParser.parseString(body).getAsJsonObject();
 
             if (!json.has("CHANNEL")) {
-                int result = getInt(json, "RESULT", 0);
+                int result = JsonFields.getInt(json, "RESULT", 0);
                 if (result != 1) {
-                    String reason = getString(json, "REASON", "unknown error");
+                    String reason = JsonFields.getString(json, "REASON", "unknown error");
                     throw new SOOPChatException("API error: " + reason);
                 }
                 throw new SOOPChatException("Response does not contain CHANNEL information");
@@ -107,11 +108,14 @@ public class SOOPLive {
 
             JsonObject channel = json.getAsJsonObject("CHANNEL");
 
-            int result = getInt(channel, "RESULT", getInt(json, "RESULT", 0));
+            int result = JsonFields.getInt(channel, "RESULT", JsonFields.getInt(json, "RESULT", 0));
 
             if (result != 1) {
                 String reason =
-                        getString(channel, "REASON", getString(json, "REASON", "unknown error"));
+                        JsonFields.getString(
+                                channel,
+                                "REASON",
+                                JsonFields.getString(json, "REASON", "unknown error"));
                 throw new SOOPChatException("API error: " + reason);
             }
 
@@ -126,16 +130,16 @@ public class SOOPLive {
                     channel.get("BJID").getAsString(),
                     bno,
                     channel.get("TITLE").getAsString(),
-                    channel.get("CHDOMAIN").getAsString().toLowerCase(),
+                    channel.get("CHDOMAIN").getAsString().toLowerCase(Locale.ROOT),
                     channel.get("CHATNO").getAsString(),
                     channel.get("FTK").getAsString(),
                     String.valueOf(channel.get("CHPT").getAsInt() + 1),
                     result,
-                    getString(channel, "BPS", ""),
-                    getString(channel, "geo_cc", ""),
-                    getString(channel, "geo_rc", ""),
-                    getString(channel, "acpt_lang", ""),
-                    getString(channel, "svc_lang", ""));
+                    JsonFields.getString(channel, "BPS", ""),
+                    JsonFields.getString(channel, "geo_cc", ""),
+                    JsonFields.getString(channel, "geo_rc", ""),
+                    JsonFields.getString(channel, "acpt_lang", ""),
+                    JsonFields.getString(channel, "svc_lang", ""));
         } catch (SOOPChatException e) {
             throw e;
         } catch (Exception e) {
@@ -163,18 +167,6 @@ public class SOOPLive {
         if (!json.has(fieldName) || json.get(fieldName).isJsonNull()) {
             throw new SOOPChatException("Required field missing: " + fieldName);
         }
-    }
-
-    private static String getString(JsonObject json, String key, String defaultValue) {
-        return json.has(key) && !json.get(key).isJsonNull()
-                ? json.get(key).getAsString()
-                : defaultValue;
-    }
-
-    private static int getInt(JsonObject json, String key, int defaultValue) {
-        return json.has(key) && !json.get(key).isJsonNull()
-                ? json.get(key).getAsInt()
-                : defaultValue;
     }
 
     private String buildCookieHeader(AuthCookie authCookie) {

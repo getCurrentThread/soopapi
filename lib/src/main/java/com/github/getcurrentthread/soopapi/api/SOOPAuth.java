@@ -46,7 +46,7 @@ public class SOOPAuth {
                             try {
                                 JsonObject json =
                                         JsonParser.parseString(response.body()).getAsJsonObject();
-                                int result = json.has("RESULT") ? json.get("RESULT").getAsInt() : 0;
+                                int result = JsonFields.getInt(json, "RESULT", 0);
 
                                 Map<String, String> cookies =
                                         parseCookies(response.headers().allValues("set-cookie"));
@@ -68,9 +68,7 @@ public class SOOPAuth {
                                             cookies.getOrDefault("_ausb", ""));
                                 } else {
                                     String reason =
-                                            json.has("REASON")
-                                                    ? json.get("REASON").getAsString()
-                                                    : "unknown error";
+                                            JsonFields.getString(json, "REASON", "unknown error");
                                     throw new AuthenticationException("Login failed: " + reason);
                                 }
                             } catch (AuthenticationException e) {
