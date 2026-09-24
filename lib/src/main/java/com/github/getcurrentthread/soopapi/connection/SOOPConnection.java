@@ -19,6 +19,7 @@ import com.github.getcurrentthread.soopapi.exception.ConnectionException;
 import com.github.getcurrentthread.soopapi.model.ChannelInfo;
 import com.github.getcurrentthread.soopapi.model.ConnectionStatus;
 import com.github.getcurrentthread.soopapi.util.SOOPChatUtils;
+import com.github.getcurrentthread.soopapi.util.SerialExecutor;
 import com.github.getcurrentthread.soopapi.websocket.WebSocketListener;
 import com.github.getcurrentthread.soopapi.websocket.WebSocketManager;
 
@@ -49,8 +50,10 @@ public class SOOPConnection implements AutoCloseable {
         this.httpClient = new SOOPHttpClient(config.getConnectionTimeout());
         this.soopLive = new SOOPLive(httpClient);
 
+        // 연결마다 lane 하나: 이벤트가 도착 순서대로, 겹치지 않게 전달된다.
         this.messageDispatcher =
-                new MessageDispatcher(SHARED_DECODERS, messageProcessor, eventEmitter);
+                new MessageDispatcher(
+                        SHARED_DECODERS, new SerialExecutor(messageProcessor), eventEmitter);
 
         WebSocketListener listener = new WebSocketListener(messageDispatcher, eventEmitter);
         this.webSocketManager =
@@ -215,6 +218,7 @@ public class SOOPConnection implements AutoCloseable {
     }
 
     public void disconnect() {
+        messageDispatcher.deactivate();
         connectionLock.lock();
         try {
             try {
@@ -229,6 +233,7 @@ public class SOOPConnection implements AutoCloseable {
 
     @Override
     public void close() {
+        messageDispatcher.deactivate();
         connectionLock.lock();
         try {
             try {

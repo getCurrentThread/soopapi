@@ -2,9 +2,15 @@ package com.github.getcurrentthread.soopapi.decoder;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.jupiter.api.BeforeEach;
@@ -17,6 +23,7 @@ import com.github.getcurrentthread.soopapi.event.EventEmitter;
 import com.github.getcurrentthread.soopapi.event.model.ChatMessageEvent;
 import com.github.getcurrentthread.soopapi.event.model.RawEvent;
 import com.github.getcurrentthread.soopapi.event.model.UnknownEvent;
+import com.github.getcurrentthread.soopapi.util.SerialExecutor;
 
 class MessageDispatcherTest {
 
@@ -153,6 +160,83 @@ class MessageDispatcherTest {
 
         dispatcher.dispatchMessage(message);
         // 여기까지 예외 없이 도달하면 테스트 통과
+    }
+
+    @Test
+    void malformedHeader_isDroppedAndCannotReachSystemEvents() {
+        dispatcher = createDispatcher(Map.of());
+
+        AtomicInteger delivered = new AtomicInteger();
+        emitter.on(ChatEvent.DISCONNECTED, e -> delivered.incrementAndGet());
+        emitter.on(ChatEvent.NONE_TYPE, e -> delivered.incrementAndGet());
+
+        // "-003"은 예전에는 DISCONNECTED(-3)로 해석될 수 있었다.
+        dispatcher.dispatchMessage(SOOPConstants.ESC + "-003" + "000010" + SOOPConstants.F + "x");
+        dispatcher.dispatchMessage("noTab" + SOOPConstants.F + "x");
+
+        assertEquals(0, delivered.get());
+    }
+
+    @Test
+    void decoderReturningNull_emitsNothing() {
+        dispatcher = createDispatcher(Map.of(ChatEvent.CHAT_MESSAGE, (parts, raw) -> null));
+
+        AtomicInteger delivered = new AtomicInteger();
+        emitter.on(ChatEvent.CHAT_MESSAGE, e -> delivered.incrementAndGet());
+
+        dispatcher.dispatchMessage(SOOPConstants.ESC + "0005000010" + SOOPConstants.F + "x");
+
+        assertEquals(0, delivered.get());
+    }
+
+    @Test
+    void deactivate_dropsQueuedAndLaterPackets() {
+        List<Runnable> queued = new ArrayList<>();
+        dispatcher = new MessageDispatcher(Map.of(), queued::add, emitter);
+
+        AtomicInteger delivered = new AtomicInteger();
+        emitter.on(ChatEvent.RAW, e -> delivered.incrementAndGet());
+
+        dispatcher.dispatchMessage("queued");
+        dispatcher.deactivate();
+        dispatcher.dispatchMessage("late");
+        queued.forEach(Runnable::run);
+
+        assertEquals(1, queued.size(), "Packets after deactivate() are not even queued");
+        assertEquals(0, delivered.get(), "Queued packets are dropped after deactivate()");
+    }
+
+    @Test
+    void laneDelivery_preservesOrderOnMultiThreadPool() throws Exception {
+        int n = 1000;
+        List<String> received = new CopyOnWriteArrayList<>();
+        AtomicInteger inFlight = new AtomicInteger();
+        AtomicInteger overlaps = new AtomicInteger();
+        CountDownLatch done = new CountDownLatch(n);
+
+        emitter.on(
+                ChatEvent.RAW,
+                (RawEvent e) -> {
+                    if (inFlight.incrementAndGet() > 1) {
+                        overlaps.incrementAndGet();
+                    }
+                    received.add(e.raw());
+                    inFlight.decrementAndGet();
+                    done.countDown();
+                });
+
+        try (ExecutorService pool = Executors.newFixedThreadPool(8)) {
+            dispatcher = new MessageDispatcher(Map.of(), new SerialExecutor(pool), emitter);
+            for (int i = 0; i < n; i++) {
+                dispatcher.dispatchMessage("m" + i);
+            }
+            assertTrue(done.await(10, TimeUnit.SECONDS));
+        }
+
+        assertEquals(0, overlaps.get(), "Listeners of one stream must not run concurrently");
+        for (int i = 0; i < n; i++) {
+            assertEquals("m" + i, received.get(i));
+        }
     }
 
     private MessageDispatcher createDispatcher(Map<ChatEvent, IMessageDecoder> decoders) {

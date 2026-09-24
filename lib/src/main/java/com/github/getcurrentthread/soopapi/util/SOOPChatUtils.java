@@ -1,7 +1,8 @@
 package com.github.getcurrentthread.soopapi.util;
 
-import java.util.logging.Level;
 import java.util.logging.Logger;
+
+import com.github.getcurrentthread.soopapi.constant.SOOPConstants;
 
 public class SOOPChatUtils {
     private static final Logger LOGGER = Logger.getLogger(SOOPChatUtils.class.getName());
@@ -92,26 +93,57 @@ public class SOOPChatUtils {
      * 서비스 코드를 파싱합니다.
      *
      * @param header 헤더 문자열
-     * @return 서비스 코드
+     * @return 서비스 코드, 헤더가 올바르지 않으면 -1
      */
     public static int parseServiceCode(String header) {
-        try {
-            String[] headerParts = header.split("\t");
-            if (headerParts.length < 2) {
-                return -1;
-            }
-            String lastPart = headerParts[headerParts.length - 1];
-            if (lastPart.length() < 4) {
-                LOGGER.warning("Last header part is too short: " + lastPart);
-                return -1;
-            }
-            return Integer.parseInt(lastPart.substring(0, 4));
-        } catch (NumberFormatException | StringIndexOutOfBoundsException e) {
-            LOGGER.log(Level.WARNING, "Error parsing service code", e);
-            return -1;
-        } catch (Exception e) {
-            LOGGER.log(Level.WARNING, "Unexpected error parsing service code", e);
+        return header == null ? -1 : parseServiceCode(header, 0, header.length());
+    }
+
+    /**
+     * {@code packet[start, end)} 구간의 헤더에서 서비스 코드를 할당 없이 파싱합니다. 마지막 TAB 뒤의 네 글자가 모두 ASCII 숫자여야 합니다.
+     *
+     * @return 0 이상의 서비스 코드, 헤더가 올바르지 않으면 -1
+     */
+    public static int parseServiceCode(String packet, int start, int end) {
+        int tab = packet.lastIndexOf('\t', end - 1);
+        if (tab < start) {
             return -1;
         }
+        int from = tab + 1;
+        if (end - from < 4) {
+            LOGGER.fine(() -> "Service code field is too short: " + packet.substring(from, end));
+            return -1;
+        }
+        int code = 0;
+        for (int i = from; i < from + 4; i++) {
+            int digit = packet.charAt(i) - '0';
+            if (digit < 0 || digit > 9) {
+                return -1;
+            }
+            code = code * 10 + digit;
+        }
+        return code;
+    }
+
+    /**
+     * {@code s}의 {@code from} 위치부터 {@link SOOPConstants#F_CHAR}로 나눈 필드를 반환합니다. {@code
+     * s.substring(from).split(F, -1)}과 결과가 같지만 중간 문자열과 리스트를 만들지 않습니다.
+     */
+    public static String[] splitFields(String s, int from) {
+        int count = 1;
+        for (int i = s.indexOf(SOOPConstants.F_CHAR, from);
+                i >= 0;
+                i = s.indexOf(SOOPConstants.F_CHAR, i + 1)) {
+            count++;
+        }
+        String[] parts = new String[count];
+        int begin = from;
+        for (int n = 0; n < count - 1; n++) {
+            int sep = s.indexOf(SOOPConstants.F_CHAR, begin);
+            parts[n] = s.substring(begin, sep);
+            begin = sep + 1;
+        }
+        parts[count - 1] = s.substring(begin);
+        return parts;
     }
 }

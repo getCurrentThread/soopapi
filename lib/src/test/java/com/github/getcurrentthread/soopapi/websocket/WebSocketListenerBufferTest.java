@@ -3,9 +3,10 @@ package com.github.getcurrentthread.soopapi.websocket;
 import static org.junit.jupiter.api.Assertions.*;
 
 import java.net.http.WebSocket;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -26,8 +27,7 @@ public class WebSocketListenerBufferTest {
     @BeforeEach
     void setup() {
         emitter = new EventEmitter();
-        var dispatcher =
-                new MessageDispatcher(Map.of(), Executors.newSingleThreadExecutor(), emitter);
+        var dispatcher = new MessageDispatcher(Map.of(), Runnable::run, emitter);
         listener = new WebSocketListener(dispatcher, emitter);
         stubWebSocket = new StubWebSocket();
     }
@@ -101,7 +101,76 @@ public class WebSocketListenerBufferTest {
         assertEquals("hello world", received.get());
     }
 
+    @Test
+    void binarySlice_withNonZeroArrayOffset_decodesOnlyTheSlice() {
+        AtomicReference<String> received = new AtomicReference<>();
+        emitter.on(ChatEvent.RAW, (RawEvent e) -> received.set(e.raw()));
+
+        byte[] backing = "XXXXhello한YYYY".getBytes(StandardCharsets.UTF_8);
+        int start = 4;
+        int length = "hello한".getBytes(StandardCharsets.UTF_8).length;
+        ByteBuffer slice = ByteBuffer.wrap(backing, start, length).slice();
+        assertNotEquals(0, slice.arrayOffset());
+
+        listener.onBinary(stubWebSocket, slice, true);
+
+        assertEquals("hello한", received.get());
+    }
+
+    @Test
+    void binaryReadOnlyBuffer_isDecoded() {
+        AtomicReference<String> received = new AtomicReference<>();
+        emitter.on(ChatEvent.RAW, (RawEvent e) -> received.set(e.raw()));
+
+        ByteBuffer readOnly =
+                ByteBuffer.wrap("read-only".getBytes(StandardCharsets.UTF_8)).asReadOnlyBuffer();
+
+        listener.onBinary(stubWebSocket, readOnly, true);
+
+        assertEquals("read-only", received.get());
+    }
+
+    @Test
+    void binaryMultibyteCharSplitAcrossFragments_isReassembled() {
+        AtomicReference<String> received = new AtomicReference<>();
+        emitter.on(ChatEvent.RAW, (RawEvent e) -> received.set(e.raw()));
+
+        byte[] bytes = "a한b".getBytes(StandardCharsets.UTF_8); // 'a' + 3바이트 한글 + 'b'
+        ByteBuffer first = ByteBuffer.wrap(bytes, 0, 2).slice(); // 한글 첫 바이트에서 자른다
+        ByteBuffer second = ByteBuffer.wrap(bytes, 2, bytes.length - 2).slice();
+
+        listener.onBinary(stubWebSocket, first, false);
+        assertNull(received.get());
+        listener.onBinary(stubWebSocket, second, true);
+
+        assertEquals("a한b", received.get());
+    }
+
+    @Test
+    void listenerFailure_stillRequestsNextFrame() {
+        CountingWebSocket ws = new CountingWebSocket();
+        emitter.on(
+                ChatEvent.RAW,
+                (RawEvent e) -> {
+                    throw new IllegalStateException("listener failure");
+                });
+
+        listener.onText(ws, "one", true);
+        listener.onBinary(ws, ByteBuffer.wrap(new byte[] {'x'}), true);
+
+        assertEquals(2, ws.requested);
+    }
+
     /** request() 호출 추적 외에는 아무 동작도 하지 않는 최소한의 WebSocket 스텁. */
+    private static class CountingWebSocket extends StubWebSocket {
+        long requested;
+
+        @Override
+        public void request(long n) {
+            requested += n;
+        }
+    }
+
     private static class StubWebSocket implements WebSocket {
         @Override
         public java.util.concurrent.CompletableFuture<WebSocket> sendText(
