@@ -65,6 +65,10 @@ class WebSocketManagerTest {
     }
 
     private WebSocketManager manager(IntToLongFunction backoff) {
+        return manager(backoff, WebSocketManager.JOIN_RESEND_INTERVAL_MS);
+    }
+
+    private WebSocketManager manager(IntToLongFunction backoff, long joinResendMs) {
         SOOPChatConfig config =
                 new SOOPChatConfig.Builder()
                         .bid("bj1")
@@ -73,7 +77,8 @@ class WebSocketManagerTest {
                         .build();
         SerialExecutor lane = new SerialExecutor(Runnable::run);
         MessageDispatcher dispatcher = new MessageDispatcher(Map.of(), lane, emitter);
-        return new WebSocketManager(config, scheduler, lane, dispatcher, emitter, opener, backoff);
+        return new WebSocketManager(
+                config, scheduler, lane, dispatcher, emitter, opener, backoff, joinResendMs);
     }
 
     private WebSocketManager manager() {
@@ -113,6 +118,59 @@ class WebSocketManagerTest {
         assertEquals(List.of(connectPacket(), joinPacket()), opener.last().sent);
         assertTrue(reconnecting.isEmpty());
         assertTrue(reconnected.isEmpty(), "Initial connect is not a reconnect");
+    }
+
+    @Test
+    void connect_completesOnlyWhenServerAnswersJoin() throws Exception {
+        opener.then(FakeWebSocket.Opener.Mode.SILENT);
+        WebSocketManager mgr = manager();
+
+        CompletableFuture<Void> connected = mgr.connect(CHANNEL);
+        FakeWebSocket ws = opener.last();
+        await(() -> ws.sent.size() == 2, "CONNECT and JOIN sent");
+
+        assertFalse(connected.isDone(), "Sending JOIN is not joining");
+        assertFalse(mgr.isConnected());
+
+        ws.serverText(FakeWebSocket.JOIN_REPLY);
+
+        connected.get(2, TimeUnit.SECONDS);
+        assertTrue(mgr.isConnected());
+        assertEquals(1, opener.attempts.get());
+    }
+
+    @Test
+    void ignoredJoin_isResentOnTheSameSocketUntilAnswered() throws Exception {
+        opener.then(FakeWebSocket.Opener.Mode.SILENT);
+        WebSocketManager mgr = manager(attempt -> 0L, 20);
+
+        CompletableFuture<Void> connected = mgr.connect(CHANNEL);
+        FakeWebSocket ws = opener.last();
+        await(() -> ws.joinSends() >= 3, "JOIN re-sent");
+        ws.serverText(FakeWebSocket.JOIN_REPLY);
+        connected.get(2, TimeUnit.SECONDS);
+
+        long joinsAtReady = ws.joinSends();
+        Thread.sleep(100);
+        assertEquals(joinsAtReady, ws.joinSends(), "No JOIN is re-sent once joined");
+        assertEquals(1, opener.attempts.get(), "Re-sending JOIN keeps the socket");
+        assertEquals(0, ws.sendPendingViolations.get());
+        assertTrue(reconnecting.isEmpty());
+    }
+
+    @Test
+    void joinNeverAnswered_failsTheAttemptAndRetries() throws Exception {
+        opener.then(FakeWebSocket.Opener.Mode.SILENT, FakeWebSocket.Opener.Mode.SUCCEED);
+        WebSocketManager mgr = manager(attempt -> 0L, 50);
+
+        mgr.connect(CHANNEL).get(5, TimeUnit.SECONDS);
+
+        FakeWebSocket silent = opener.sockets.getFirst();
+        assertTrue(silent.aborted, "The socket that never joined is dropped");
+        assertEquals(2, opener.attempts.get());
+        assertEquals(1, reconnecting.size());
+        assertTrue(reconnected.isEmpty(), "A retried initial connect is not a reconnect");
+        assertTrue(mgr.isConnected());
     }
 
     @Test
@@ -379,16 +437,21 @@ class WebSocketManagerTest {
     }
 
     @Test
-    void retryCount_resetsOnFirstInboundFrameNotOnSend() throws Exception {
+    void retryCount_resetsOnJoinReplyNotOnSend() throws Exception {
+        opener.then(FakeWebSocket.Opener.Mode.SUCCEED, FakeWebSocket.Opener.Mode.SILENT);
         WebSocketManager mgr = manager();
         mgr.connect(CHANNEL).get(2, TimeUnit.SECONDS);
         opener.last().serverClose(1006, "");
+        await(() -> opener.attempts.get() == 2, "retry opened");
+        FakeWebSocket second = opener.last();
+        await(() -> second.sent.size() == 2, "CONNECT and JOIN sent on retry");
+
+        assertEquals(1, mgr.getStatus().get().retryCount(), "Sending is not proof of health");
+        second.serverText("data");
+        assertEquals(1, mgr.getStatus().get().retryCount(), "Other traffic is not a join");
+
+        second.serverText(FakeWebSocket.JOIN_REPLY);
         await(() -> recovered(mgr), "recovery");
-
-        mgr.sendChat("hello").get(2, TimeUnit.SECONDS);
-        assertEquals(1, mgr.getStatus().get().retryCount(), "A send is not proof of health");
-
-        opener.last().serverText("data");
         assertEquals(0, mgr.getStatus().get().retryCount());
     }
 

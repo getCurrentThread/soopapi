@@ -37,6 +37,8 @@ import com.github.getcurrentthread.soopapi.util.SerialExecutor;
  * 채팅 서버와의 WebSocket 연결 하나를 관리합니다.
  *
  * <ul>
+ *   <li><b>수립</b>은 서버가 JOIN에 응답한 시점입니다. 서버는 같은 클라이언트의 이전 세션이 정리되기 전(수 초)에 온 JOIN을 조용히 무시하므로, 응답이
+ *       없으면 같은 소켓에 JOIN을 주기적으로 다시 보내고, 끝내 응답이 없으면 그 시도를 실패로 처리합니다.
  *   <li><b>송신</b>은 소켓별 체인으로 직렬화됩니다. CONNECT·JOIN이 항상 먼저 나가고, 이후 송신은 앞선 송신이 끝난 뒤에 나갑니다.
  *   <li><b>소켓 식별</b>은 {@code Socket} 객체로 합니다. 교체되거나 닫힌 소켓의 콜백은 무시되고, 그 소켓의 수신 데이터는 버려집니다.
  *   <li><b>끊김 정책</b>: 수립된 소켓이 Close 프레임(1006 제외)을 받으면 연결을 끝냅니다({@link #terminated()} 정상 완료). 전송 오류,
@@ -51,6 +53,8 @@ public class WebSocketManager implements AutoCloseable {
     private static final Logger LOGGER = Logger.getLogger(WebSocketManager.class.getName());
     static final long INITIAL_RETRY_DELAY_MS = 2000;
     static final long MAX_RETRY_DELAY_MS = 30000;
+    static final long JOIN_RESEND_INTERVAL_MS = 1000;
+    static final long MAX_JOIN_WAIT_MS = 10_000;
     private static final int ABNORMAL_CLOSURE = 1006;
 
     /** WebSocket용 HttpClient는 SSLContext마다 하나를 공유하며 닫지 않습니다. 스레드는 모두 데몬입니다. */
@@ -73,6 +77,8 @@ public class WebSocketManager implements AutoCloseable {
     private final Opener opener;
     private final IntToLongFunction backoff;
     private final long sendTimeoutMs;
+    private final long joinResendMs;
+    private final long joinWaitMs;
     private final CompletableFuture<DisconnectedEvent> terminated = new CompletableFuture<>();
 
     private final ReentrantLock lock = new ReentrantLock();
@@ -103,7 +109,8 @@ public class WebSocketManager implements AutoCloseable {
                 dispatcher,
                 eventEmitter,
                 defaultOpener(config),
-                WebSocketManager::backoffMillis);
+                WebSocketManager::backoffMillis,
+                JOIN_RESEND_INTERVAL_MS);
     }
 
     WebSocketManager(
@@ -113,7 +120,8 @@ public class WebSocketManager implements AutoCloseable {
             MessageDispatcher dispatcher,
             EventEmitter eventEmitter,
             Opener opener,
-            IntToLongFunction backoff) {
+            IntToLongFunction backoff,
+            long joinResendMs) {
         this.config = Objects.requireNonNull(config, "config");
         this.scheduler = Objects.requireNonNull(scheduler, "scheduler");
         this.lane = Objects.requireNonNull(lane, "lane");
@@ -122,6 +130,8 @@ public class WebSocketManager implements AutoCloseable {
         this.opener = Objects.requireNonNull(opener, "opener");
         this.backoff = Objects.requireNonNull(backoff, "backoff");
         this.sendTimeoutMs = config.getConnectionTimeout().toMillis();
+        this.joinResendMs = joinResendMs;
+        this.joinWaitMs = Math.min(sendTimeoutMs, MAX_JOIN_WAIT_MS);
     }
 
     private static Opener defaultOpener(SOOPChatConfig config) {
@@ -148,8 +158,8 @@ public class WebSocketManager implements AutoCloseable {
     /**
      * 채널에 연결합니다. 실패하면 backoff로 재시도합니다.
      *
-     * @return 연결이 수립되면(CONNECT·JOIN 송신 완료) 완료되고, 재시도를 다 쓰거나 닫히면 예외로 완료되는 future. 이미 진행 중인 연결이 있으면 그
-     *     결과를 따릅니다.
+     * @return 연결이 수립되면(서버가 JOIN에 응답하면) 완료되고, 재시도를 다 쓰거나 닫히면 예외로 완료되는 future. 이미 진행 중인 연결이 있으면 그 결과를
+     *     따릅니다.
      */
     public CompletableFuture<Void> connect(ChannelInfo channelInfo) {
         URI target;
@@ -318,7 +328,7 @@ public class WebSocketManager implements AutoCloseable {
         }
     }
 
-    /** CONNECT·JOIN을 보낸 소켓이 살아 있으면 true. */
+    /** 채널에 들어간(서버가 JOIN에 응답한) 소켓이 살아 있으면 true. */
     public boolean isConnected() {
         Socket sock = current;
         return !closed && sock != null && sock.ready;
@@ -397,14 +407,7 @@ public class WebSocketManager implements AutoCloseable {
                 Link join = enqueue(sock, joinPacket);
                 after.add(connect::start);
                 after.add(join::start);
-                after.add(
-                        () ->
-                                join.done.whenComplete(
-                                        (r, e) -> {
-                                            if (e == null) {
-                                                onReady(sock);
-                                            }
-                                        }));
+                after.add(() -> armJoinTimer(sock));
             }
         } finally {
             lock.unlock();
@@ -412,6 +415,66 @@ public class WebSocketManager implements AutoCloseable {
         after.forEach(Runnable::run);
     }
 
+    /** JOIN 응답을 기다리는 동안 JOIN을 주기적으로 다시 보내고, 기한을 넘기면 시도를 실패로 처리하는 타이머를 건다. */
+    private void armJoinTimer(Socket sock) {
+        ScheduledFuture<?> task;
+        try {
+            task =
+                    scheduler.scheduleWithFixedDelay(
+                            () -> onJoinTimer(sock),
+                            joinResendMs,
+                            joinResendMs,
+                            TimeUnit.MILLISECONDS);
+        } catch (RejectedExecutionException e) {
+            transportFailure(sock, e);
+            return;
+        }
+        boolean stale;
+        lock.lock();
+        try {
+            stale = sock != current || closed || sock.ready;
+            if (!stale) {
+                sock.joinTimer = task;
+            }
+        } finally {
+            lock.unlock();
+        }
+        if (stale) {
+            task.cancel(false);
+        }
+    }
+
+    private void onJoinTimer(Socket sock) {
+        Link resend = null;
+        List<Runnable> after = new ArrayList<>();
+        lock.lock();
+        try {
+            if (sock != current || closed || sock.ready) {
+                return;
+            }
+            long waited = ++sock.joinTicks * joinResendMs;
+            if (waited >= joinWaitMs) {
+                LOGGER.warning(
+                        "WebSocket #" + sock.id + ": no JOIN reply within " + joinWaitMs + "ms");
+                attemptFailed(
+                        sock,
+                        new ConnectionException(
+                                "Server did not answer JOIN within " + joinWaitMs + "ms"),
+                        after);
+            } else {
+                resend = enqueue(sock, joinPacket);
+            }
+        } finally {
+            lock.unlock();
+        }
+        if (resend != null) {
+            LOGGER.fine(() -> "Re-sending JOIN on WebSocket #" + sock.id);
+            resend.start();
+        }
+        after.forEach(Runnable::run);
+    }
+
+    /** 서버가 JOIN에 응답했다. 채널에 들어간 건강한 세션이므로 재시도 횟수도 되돌린다. */
     private void onReady(Socket sock) {
         CompletableFuture<Void> seq;
         ReconnectedEvent reconnected = null;
@@ -421,6 +484,7 @@ public class WebSocketManager implements AutoCloseable {
                 return;
             }
             sock.ready = true;
+            cancelJoinTimer(sock);
             sock.ping = schedulePing(sock);
             seq = sequence;
             sequence = null;
@@ -433,6 +497,7 @@ public class WebSocketManager implements AutoCloseable {
                                 System.currentTimeMillis());
             }
             recovery = false;
+            retryCount = 0;
         } finally {
             lock.unlock();
         }
@@ -470,22 +535,6 @@ public class WebSocketManager implements AutoCloseable {
         }
         LOGGER.fine("Sending ping packet");
         link.start();
-    }
-
-    private void onInbound(Socket sock) {
-        if (sock.seenData) {
-            return;
-        }
-        lock.lock();
-        try {
-            // 수립된 소켓에서 처음 데이터를 받아야 재시도 횟수를 되돌린다. 송신 성공만으로는 되돌리지 않는다.
-            if (sock == current && sock.ready && !sock.seenData) {
-                sock.seenData = true;
-                retryCount = 0;
-            }
-        } finally {
-            lock.unlock();
-        }
     }
 
     private void onServerClosed(Socket sock, int statusCode, String reason) {
@@ -668,11 +717,20 @@ public class WebSocketManager implements AutoCloseable {
             sock.ping.cancel(false);
             sock.ping = null;
         }
+        cancelJoinTimer(sock);
         sock.listener.detach();
         if (current == sock) {
             current = null;
         }
         return sock.ws;
+    }
+
+    /** lock 안에서 호출. */
+    private static void cancelJoinTimer(Socket sock) {
+        if (sock.joinTimer != null) {
+            sock.joinTimer.cancel(false);
+            sock.joinTimer = null;
+        }
     }
 
     /** lock 안에서 호출. 송신 체인 끝에 고리를 붙인다. 실제 송신은 lock 밖에서 {@link Link#start()}로 시작한다. */
@@ -727,8 +785,9 @@ public class WebSocketManager implements AutoCloseable {
         WebSocket ws;
         CompletableFuture<Void> tail = CompletableFuture.completedFuture(null);
         ScheduledFuture<?> ping;
+        ScheduledFuture<?> joinTimer;
+        int joinTicks;
         volatile boolean ready;
-        volatile boolean seenData;
 
         Socket(int id) {
             this.id = id;
@@ -736,8 +795,8 @@ public class WebSocketManager implements AutoCloseable {
         }
 
         @Override
-        public void onInbound() {
-            WebSocketManager.this.onInbound(this);
+        public void onJoinReply() {
+            onReady(this);
         }
 
         @Override

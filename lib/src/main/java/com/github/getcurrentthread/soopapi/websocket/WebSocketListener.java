@@ -9,7 +9,10 @@ import java.util.concurrent.CompletionStage;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
+import com.github.getcurrentthread.soopapi.constant.SOOPConstants;
 import com.github.getcurrentthread.soopapi.decoder.MessageDispatcher;
+import com.github.getcurrentthread.soopapi.event.ChatEvent;
+import com.github.getcurrentthread.soopapi.util.SOOPChatUtils;
 import com.github.getcurrentthread.soopapi.util.SerialExecutor;
 
 /**
@@ -17,6 +20,7 @@ import com.github.getcurrentthread.soopapi.util.SerialExecutor;
  * Callbacks}로 알립니다.
  *
  * <ul>
+ *   <li>서버의 첫 JOIN 응답을 {@link Callbacks#onJoinReply()}로 알립니다. 소켓은 이때 수립된 것으로 봅니다.
  *   <li>콜백 안의 예외는 여기서 격리합니다. 예외가 JDK까지 전파되면 연결이 {@code onError}로 끊기기 때문입니다.
  *   <li>{@link #detach()} 뒤에는 데이터와 알림을 버리되, 닫힘 응답을 읽을 수 있도록 다음 프레임 요청은 계속합니다.
  *   <li>lane의 대기 태스크가 {@link #HIGH_WATER}를 넘으면 다음 프레임 요청을 멈추고, {@link #LOW_WATER} 이하로 내려오면 다시
@@ -31,8 +35,8 @@ public final class WebSocketListener implements WebSocket.Listener {
 
     /** 소켓 수명주기 알림. JDK 수신 스레드에서 호출됩니다. */
     interface Callbacks {
-        /** 프레임을 하나 받았을 때. */
-        void onInbound();
+        /** 서버가 JOIN에 처음 응답했을 때(서비스 코드 0002). 소켓마다 한 번만 호출됩니다. */
+        void onJoinReply();
 
         /** 상대가 닫았을 때. Close 프레임 없이 끊기면 {@code statusCode}는 1006입니다. */
         void onClosed(int statusCode, String reason);
@@ -47,6 +51,8 @@ public final class WebSocketListener implements WebSocket.Listener {
     private final StringBuilder textBuffer = new StringBuilder(DEFAULT_BUFFER_SIZE);
     private ByteArrayOutputStream binaryBuffer = new ByteArrayOutputStream(DEFAULT_BUFFER_SIZE);
     private volatile boolean detached;
+    // JDK는 리스너 호출을 직렬화하므로 수신 스레드에서만 읽고 쓴다.
+    private boolean joinReplied;
 
     /**
      * @param lane 백프레셔 기준이 되는 lane. {@code null}이면 백프레셔를 걸지 않습니다.
@@ -76,16 +82,15 @@ public final class WebSocketListener implements WebSocket.Listener {
                 textBuffer.setLength(0);
                 return null;
             }
-            callbacks.onInbound();
             if (last && textBuffer.isEmpty()) {
                 // 조각나지 않은 프레임은 버퍼를 거치지 않는다.
-                messageDispatcher.dispatchMessage(data.toString());
+                deliver(data.toString());
             } else {
                 textBuffer.append(data);
                 if (last) {
                     String message = textBuffer.toString();
                     resetTextBuffer();
-                    messageDispatcher.dispatchMessage(message);
+                    deliver(message);
                 }
             }
             requestNext = !pauseIfBacklogged(webSocket);
@@ -108,15 +113,14 @@ public final class WebSocketListener implements WebSocket.Listener {
                 binaryBuffer.reset();
                 return null;
             }
-            callbacks.onInbound();
             if (last && binaryBuffer.size() == 0) {
-                messageDispatcher.dispatchMessage(decodeUtf8(data));
+                deliver(decodeUtf8(data));
             } else {
                 appendBinary(data);
                 if (last) {
                     String message = binaryBuffer.toString(StandardCharsets.UTF_8);
                     resetBinaryBuffer();
-                    messageDispatcher.dispatchMessage(message);
+                    deliver(message);
                 }
             }
             requestNext = !pauseIfBacklogged(webSocket);
@@ -133,24 +137,13 @@ public final class WebSocketListener implements WebSocket.Listener {
 
     @Override
     public CompletionStage<?> onPing(WebSocket webSocket, ByteBuffer message) {
-        return onControlFrame(webSocket);
+        webSocket.request(1);
+        return null;
     }
 
     @Override
     public CompletionStage<?> onPong(WebSocket webSocket, ByteBuffer message) {
-        return onControlFrame(webSocket);
-    }
-
-    private CompletionStage<?> onControlFrame(WebSocket webSocket) {
-        try {
-            if (!detached) {
-                callbacks.onInbound();
-            }
-        } catch (Exception e) {
-            LOGGER.log(Level.WARNING, "Error handling control frame", e);
-        } finally {
-            webSocket.request(1);
-        }
+        webSocket.request(1);
         return null;
     }
 
@@ -177,6 +170,22 @@ public final class WebSocketListener implements WebSocket.Listener {
             LOGGER.log(Level.WARNING, "Error handling WebSocket close", e);
         }
         return null;
+    }
+
+    /** 완성된 메시지를 dispatcher에 넘긴다. 첫 JOIN 응답이면 먼저 알려, JOIN_CHANNEL 리스너가 수립된 연결을 보게 한다. */
+    private void deliver(String message) {
+        if (!joinReplied && isJoinReply(message)) {
+            joinReplied = true;
+            callbacks.onJoinReply();
+        }
+        messageDispatcher.dispatchMessage(message);
+    }
+
+    static boolean isJoinReply(String message) {
+        int sep = message.indexOf(SOOPConstants.F_CHAR);
+        return sep > 0
+                && SOOPChatUtils.parseServiceCode(message, 0, sep)
+                        == ChatEvent.JOIN_CHANNEL.getCode();
     }
 
     /** lane이 밀려 있으면 요청을 보류하고, 풀리면 다시 요청하도록 예약한다. 보류했으면 true. */

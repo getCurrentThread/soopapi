@@ -26,7 +26,7 @@ public class WebSocketListenerBufferTest {
     private static final WebSocketListener.Callbacks NO_CALLBACKS =
             new WebSocketListener.Callbacks() {
                 @Override
-                public void onInbound() {}
+                public void onJoinReply() {}
 
                 @Override
                 public void onClosed(int statusCode, String reason) {}
@@ -45,6 +45,43 @@ public class WebSocketListenerBufferTest {
         var dispatcher = new MessageDispatcher(Map.of(), Runnable::run, emitter);
         listener = new WebSocketListener(dispatcher, null, NO_CALLBACKS);
         stubWebSocket = new StubWebSocket();
+    }
+
+    @Test
+    void joinReply_isSignalledOncePerSocketBeforeDispatch() {
+        java.util.List<String> order = new java.util.concurrent.CopyOnWriteArrayList<>();
+        emitter.on(ChatEvent.RAW, (RawEvent e) -> order.add("raw"));
+        WebSocketListener.Callbacks callbacks =
+                new WebSocketListener.Callbacks() {
+                    @Override
+                    public void onJoinReply() {
+                        order.add("join");
+                    }
+
+                    @Override
+                    public void onClosed(int statusCode, String reason) {}
+
+                    @Override
+                    public void onFailed(Throwable error) {}
+                };
+        var dispatcher = new MessageDispatcher(Map.of(), Runnable::run, emitter);
+        var joinListener = new WebSocketListener(dispatcher, null, callbacks);
+        String login = "\u001b\t000100000500\u000cguest\u000c";
+        String join = "\u001b\t000200000600\u000c1000\u000c";
+
+        joinListener.onText(stubWebSocket, login, true);
+        joinListener.onText(stubWebSocket, join, true);
+        joinListener.onText(stubWebSocket, join, true);
+
+        assertEquals(List.of("raw", "join", "raw", "raw"), order);
+    }
+
+    @Test
+    void isJoinReply_readsOnlyTheHeaderCode() {
+        assertTrue(WebSocketListener.isJoinReply("\u001b\t000200000600\u000c1000\u000c"));
+        assertFalse(WebSocketListener.isJoinReply("\u001b\t000500000600\u000chi\u000c"));
+        assertFalse(WebSocketListener.isJoinReply("no header"));
+        assertFalse(WebSocketListener.isJoinReply("\u000c0002"));
     }
 
     @Test

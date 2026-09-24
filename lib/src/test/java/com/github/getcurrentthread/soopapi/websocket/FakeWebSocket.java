@@ -16,9 +16,14 @@ import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * 테스트용 WebSocket. JDK처럼 텍스트 송신이 끝나기 전에 다음 송신이 오면 {@code IllegalStateException("Send pending")}으로
- * 실패하고, 서버 쪽 동작(수신, 닫힘, 오류)을 흉내 낼 수 있습니다.
+ * 실패하고, 서버 쪽 동작(수신, 닫힘, 오류)을 흉내 낼 수 있습니다. 실제 서버처럼 JOIN 송신이 끝나면 JOIN 응답을 돌려줍니다({@link #answerJoin}).
  */
 final class FakeWebSocket implements WebSocket {
+    /** 서버의 JOIN 응답(서비스 코드 0002). */
+    static final String JOIN_REPLY = "\u001b\t000200000600\u000c1000\u000c";
+
+    private static final String JOIN_HEADER = "\u001b\t0002";
+
     final Listener listener;
     final List<String> sent = new CopyOnWriteArrayList<>();
     final AtomicInteger sendPendingViolations = new AtomicInteger();
@@ -27,7 +32,9 @@ final class FakeWebSocket implements WebSocket {
     volatile boolean aborted;
     volatile boolean manualSends;
     volatile Throwable failNextSend;
+    volatile boolean answerJoin = true;
     private CompletableFuture<WebSocket> inFlight;
+    private String inFlightPacket;
 
     FakeWebSocket(Listener listener) {
         this.listener = listener;
@@ -52,9 +59,11 @@ final class FakeWebSocket implements WebSocket {
                 return inFlight;
             }
             f = inFlight = new CompletableFuture<>();
+            inFlightPacket = data.toString();
         }
         if (!manualSends) {
             f.complete(this);
+            answerIfJoin(data.toString());
         }
         return f;
     }
@@ -62,10 +71,27 @@ final class FakeWebSocket implements WebSocket {
     /** 수동 모드에서 진행 중인 텍스트 송신 하나를 완료합니다. 완료할 송신이 있었으면 true. */
     boolean completeSend() {
         CompletableFuture<WebSocket> f;
+        String packet;
         synchronized (this) {
             f = inFlight;
+            packet = inFlightPacket;
         }
-        return f != null && f.complete(this);
+        boolean completed = f != null && f.complete(this);
+        if (completed) {
+            answerIfJoin(packet);
+        }
+        return completed;
+    }
+
+    /** JOIN 송신 몇 번이 나갔는지. */
+    long joinSends() {
+        return sent.stream().filter(p -> p.startsWith(JOIN_HEADER)).count();
+    }
+
+    private void answerIfJoin(String packet) {
+        if (answerJoin && !aborted && packet.startsWith(JOIN_HEADER)) {
+            serverText(JOIN_REPLY);
+        }
     }
 
     @Override
@@ -140,14 +166,16 @@ final class FakeWebSocket implements WebSocket {
             SUCCEED,
             /** 여는 데 실패한다. */
             FAIL,
-            /** 열린 뒤 곧바로 1006으로 끊긴다. */
+            /** 열린 뒤 JOIN에 응답하지 않고 곧바로 1006으로 끊긴다. */
             OPEN_THEN_DROP,
             /** future를 테스트가 직접 완료한다. */
             MANUAL,
             /** future가 완료되기 전에 onOpen과 첫 프레임이 먼저 온다. */
             OPEN_EARLY,
             /** opener 자체가 예외를 던진다. */
-            THROW
+            THROW,
+            /** 열리지만 JOIN에 응답하지 않는다. */
+            SILENT
         }
 
         final List<FakeWebSocket> sockets = new CopyOnWriteArrayList<>();
@@ -183,9 +211,10 @@ final class FakeWebSocket implements WebSocket {
             }
             FakeWebSocket ws = new FakeWebSocket(listener);
             ws.manualSends = manualSends;
+            ws.answerJoin = mode != Mode.SILENT && mode != Mode.OPEN_THEN_DROP;
             sockets.add(ws);
             switch (mode) {
-                case SUCCEED -> {
+                case SUCCEED, SILENT -> {
                     listener.onOpen(ws);
                     return CompletableFuture.completedFuture(ws);
                 }
