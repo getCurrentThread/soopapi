@@ -9,7 +9,7 @@
 ## 핵심 정보
 
 - GitHub: https://github.com/getCurrentThread/soopapi
-- 버전: v0.14.0
+- 버전: v0.15.0
 - 라이선스: MIT
 - 언어: Java 25 이상
 - 빌드: Gradle 9.3.1
@@ -22,7 +22,7 @@
 repositories { maven { url 'https://jitpack.io' } }
 
 dependencies {
-    implementation 'com.github.getCurrentThread:soopapi:v0.14.0' // 최신 버전은 핵심 정보 참조
+    implementation 'com.github.getCurrentThread:soopapi:v0.15.0' // 최신 버전은 핵심 정보 참조
 }
 ```
 
