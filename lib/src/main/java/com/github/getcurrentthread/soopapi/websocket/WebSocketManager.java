@@ -354,10 +354,6 @@ public class WebSocketManager implements AutoCloseable {
         return send(() -> WebSocketPacketBuilder.createWhisperPacket(targetId, message));
     }
 
-    public CompletableFuture<Void> sendEnterInfo(String synAck) {
-        return send(() -> WebSocketPacketBuilder.createEnterInfoPacket(synAck));
-    }
-
     public CompletableFuture<WebSocketStatus> getStatus() {
         lock.lock();
         try {
