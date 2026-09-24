@@ -5,7 +5,8 @@ plugins {
 }
 
 group = 'com.github.getCurrentThread'
-version = rootProject.findProperty('version') ?: '0.0.0-SNAPSHOT'
+// project.findProperty('version')는 속성이 없어도 'unspecified'를 돌려주므로 Gradle 속성만 본다.
+version = providers.gradleProperty('version').getOrElse('0.0.0-SNAPSHOT')
 
 repositories {
     mavenCentral()
@@ -15,8 +16,6 @@ dependencies {
     testImplementation platform('org.junit:junit-bom:5.11.4')
     testImplementation 'org.junit.jupiter:junit-jupiter'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
-    testImplementation 'org.mockito:mockito-core:5.14.2'
-    testImplementation 'org.mockito:mockito-junit-jupiter:5.14.2'
 
     implementation libs.gson
 }
@@ -56,7 +55,10 @@ tasks.withType(Javadoc) {
 
 tasks.withType(JavaCompile) {
     options.encoding = 'UTF-8'
-    dependsOn 'spotlessApply'
+    // 로컬에서는 컴파일 전에 포맷을 맞춘다. CI에서는 고치지 않고 spotlessCheck(check에 포함)로 위반을 드러낸다.
+    if (!providers.environmentVariable('CI').isPresent()) {
+        dependsOn 'spotlessApply'
+    }
 }
 
 tasks.register('collectFixtures', JavaExec) {
