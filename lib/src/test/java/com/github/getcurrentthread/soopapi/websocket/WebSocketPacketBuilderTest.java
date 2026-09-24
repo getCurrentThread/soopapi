@@ -209,9 +209,60 @@ class WebSocketPacketBuilderTest {
     }
 
     @Test
-    void calculateByteSize_returnsNonNegative() {
-        int size = WebSocketPacketBuilder.calculateByteSize("test");
-        assertTrue(size > 0, "Byte size should be positive for non-empty data");
+    void chatPacket_rejectsFieldSeparatorAndEsc() {
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> WebSocketPacketBuilder.createChatPacket("a" + SOOPConstants.F + "b"));
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> WebSocketPacketBuilder.createChatPacket("a" + SOOPConstants.ESC + "0005"));
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> WebSocketPacketBuilder.createChatPacket(null));
+    }
+
+    @Test
+    void whisperPacket_rejectsFieldSeparatorInEitherField() {
+        assertThrows(
+                IllegalArgumentException.class,
+                () ->
+                        WebSocketPacketBuilder.createWhisperPacket(
+                                "target" + SOOPConstants.F + "other", "hi"));
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> WebSocketPacketBuilder.createWhisperPacket("target", "hi" + SOOPConstants.F));
+    }
+
+    @Test
+    void chatPacket_rejectsUnpairedSurrogate() {
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> WebSocketPacketBuilder.createChatPacket("broken \ud83d"));
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> WebSocketPacketBuilder.createChatPacket("\ude00 broken"));
+    }
+
+    @Test
+    void chatPacket_acceptsSurrogatePairAndCountsFourBytes() {
+        // F + 이모지(4바이트) + F×6 = 11
+        String packet = WebSocketPacketBuilder.createChatPacket("\ud83d\ude00");
+        int lengthStart = SOOPConstants.ESC.length() + 4;
+
+        assertEquals("000011", packet.substring(lengthStart, lengthStart + 6));
+    }
+
+    @Test
+    void chatPacket_rejectsPayloadThatOverflowsLengthField() {
+        // 채팅 payload는 message + 7바이트(앞 F 1개, 뒤 F 6개)
+        int maxMessage = WebSocketPacketBuilder.MAX_PAYLOAD_BYTES - 7;
+        String packet = WebSocketPacketBuilder.createChatPacket("a".repeat(maxMessage));
+        int lengthStart = SOOPConstants.ESC.length() + 4;
+        assertEquals("999999", packet.substring(lengthStart, lengthStart + 6));
+
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> WebSocketPacketBuilder.createChatPacket("a".repeat(maxMessage + 1)));
     }
 
     @Test

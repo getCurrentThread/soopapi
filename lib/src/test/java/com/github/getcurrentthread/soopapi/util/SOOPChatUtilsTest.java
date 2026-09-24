@@ -62,16 +62,11 @@ class SOOPChatUtilsTest {
         assertEquals(99L, SOOPChatUtils.safeParseLong(null, 99L));
     }
 
-    // --- utf8ByteLength & calculateByteSize 테스트 ---
+    // --- utf8ByteLength 테스트 ---
 
     @Test
     void utf8ByteLength_ascii() {
         assertEquals(5, SOOPChatUtils.utf8ByteLength("hello"));
-    }
-
-    @Test
-    void calculateByteSize_ascii() {
-        assertEquals(11, SOOPChatUtils.calculateByteSize("hello"));
     }
 
     @Test
@@ -80,8 +75,8 @@ class SOOPChatUtilsTest {
     }
 
     @Test
-    void calculateByteSize_korean() {
-        assertEquals(12, SOOPChatUtils.calculateByteSize("\ud55c\uae00"));
+    void utf8ByteLength_surrogatePair() {
+        assertEquals(4, SOOPChatUtils.utf8ByteLength("\ud83d\ude00"));
     }
 
     // --- splitFields \ud14c\uc2a4\ud2b8 ---

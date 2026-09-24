@@ -116,6 +116,21 @@ class WebSocketManagerTest {
     }
 
     @Test
+    void invalidMessage_failsWithoutTouchingTheSocket() throws Exception {
+        WebSocketManager mgr = manager();
+        mgr.connect(CHANNEL).get(2, TimeUnit.SECONDS);
+
+        ExecutionException ex =
+                assertThrows(
+                        ExecutionException.class,
+                        () -> mgr.sendChat("a\u000cb").get(1, TimeUnit.SECONDS));
+
+        assertInstanceOf(IllegalArgumentException.class, ex.getCause());
+        assertEquals(2, opener.last().sent.size(), "Only CONNECT and JOIN were sent");
+        assertTrue(mgr.isConnected(), "A rejected message is not a transport failure");
+    }
+
+    @Test
     void concurrentSends_areSerializedBehindHandshake() throws Exception {
         opener.manualSends = true;
         WebSocketManager mgr = manager();

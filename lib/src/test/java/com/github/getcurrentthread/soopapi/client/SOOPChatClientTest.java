@@ -169,6 +169,33 @@ public class SOOPChatClientTest {
     }
 
     @Test
+    void sendChat_blankMessage_failsBeforeAuthCheck() {
+        SOOPChatConfig config =
+                new SOOPChatConfig.Builder().bid("testStreamer").bno("12345").build();
+        SOOPChatClient client = new SOOPChatClient(config);
+
+        for (String message : new String[] {null, "", "   "}) {
+            ExecutionException ex =
+                    assertThrows(ExecutionException.class, () -> client.sendChat(message).get());
+            assertInstanceOf(IllegalArgumentException.class, ex.getCause());
+        }
+    }
+
+    @Test
+    void sendWhisper_blankMessage_failsBeforeAuthCheck() {
+        SOOPChatConfig config =
+                new SOOPChatConfig.Builder().bid("testStreamer").bno("12345").build();
+        SOOPChatClient client = new SOOPChatClient(config);
+
+        ExecutionException ex =
+                assertThrows(
+                        ExecutionException.class,
+                        () -> client.sendWhisper("targetUser", " ").get());
+
+        assertInstanceOf(IllegalArgumentException.class, ex.getCause());
+    }
+
+    @Test
     void constructor_withoutBno_doesNotThrow() {
         SOOPChatConfig config = new SOOPChatConfig.Builder().bid("testStreamer").build();
 

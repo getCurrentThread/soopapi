@@ -9,16 +9,6 @@ public class SOOPChatUtils {
 
     private SOOPChatUtils() {}
 
-    /**
-     * 바이트 크기를 계산합니다.
-     *
-     * @param string 크기를 계산할 문자열
-     * @return 바이트 크기
-     */
-    public static int calculateByteSize(String string) {
-        return utf8ByteLength(string) + 6;
-    }
-
     /** 바이트 배열 할당 없이 UTF-8 바이트 길이를 계산합니다. */
     public static int utf8ByteLength(String s) {
         int count = 0;

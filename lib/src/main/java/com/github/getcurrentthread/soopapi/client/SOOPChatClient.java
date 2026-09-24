@@ -185,7 +185,17 @@ public class SOOPChatClient implements AutoCloseable {
         }
     }
 
+    /**
+     * 채팅 메시지를 전송합니다.
+     *
+     * @param message 전송할 메시지. 비어 있을 수 없고, 제어 문자 U+000C·U+001B를 포함할 수 없습니다.
+     * @return 전송이 완료되면 완료되는 CompletableFuture. 메시지가 올바르지 않으면 {@link IllegalArgumentException}, 인증되지
+     *     않았으면 {@link AuthenticationException}, 연결되지 않았으면 {@link IllegalStateException}으로 예외 완료됩니다.
+     */
     public CompletableFuture<Void> sendChat(String message) {
+        if (message == null || message.isBlank()) {
+            return CompletableFuture.failedFuture(blankMessageException());
+        }
         if (!config.isAuthenticated()) {
             return CompletableFuture.failedFuture(
                     new AuthenticationException(
@@ -203,14 +213,17 @@ public class SOOPChatClient implements AutoCloseable {
      *
      * @param targetId 받는 사람의 SOOP 로그인 ID (예: {@code "targetUser"}). 닉네임이나 런타임 {@code (n)} 접미사 형태가
      *     아닙니다.
-     * @param message 전송할 메시지
-     * @return 전송이 완료되면 완료되는 CompletableFuture. 인증되지 않았거나 연결되지 않은 경우, 또는 {@code targetId}가 비어 있는 경우
-     *     예외로 완료됩니다.
+     * @param message 전송할 메시지. 비어 있을 수 없고, 제어 문자 U+000C·U+001B를 포함할 수 없습니다.
+     * @return 전송이 완료되면 완료되는 CompletableFuture. 인자가 올바르지 않으면 {@link IllegalArgumentException}, 인증되지
+     *     않았으면 {@link AuthenticationException}, 연결되지 않았으면 {@link IllegalStateException}으로 예외 완료됩니다.
      */
     public CompletableFuture<Void> sendWhisper(String targetId, String message) {
         if (targetId == null || targetId.isBlank()) {
             return CompletableFuture.failedFuture(
                     new IllegalArgumentException("targetId must not be null or blank"));
+        }
+        if (message == null || message.isBlank()) {
+            return CompletableFuture.failedFuture(blankMessageException());
         }
         if (!config.isAuthenticated()) {
             return CompletableFuture.failedFuture(
@@ -396,6 +409,10 @@ public class SOOPChatClient implements AutoCloseable {
         return cause instanceof ConnectionException ce
                 ? ce
                 : new ConnectionException("Chat connection failed", cause);
+    }
+
+    private static IllegalArgumentException blankMessageException() {
+        return new IllegalArgumentException("message must not be null or blank");
     }
 
     private static IllegalStateException notConnectedException() {
