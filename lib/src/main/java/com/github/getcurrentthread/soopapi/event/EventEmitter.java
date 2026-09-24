@@ -4,6 +4,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -18,7 +19,6 @@ public class EventEmitter {
             new ConcurrentHashMap<>();
     private final Map<ChatEvent, List<EventListener<? extends BaseEvent>>> internalListeners =
             new ConcurrentHashMap<>();
-    private final Map<EventListener<?>, EventListener<?>> onceWrappers = new ConcurrentHashMap<>();
     private volatile Consumer<EventEmitterException> errorHandler;
 
     @SuppressWarnings("unchecked")
@@ -41,36 +41,28 @@ public class EventEmitter {
     /**
      * 이벤트를 한 번만 수신하는 리스너를 등록합니다.
      *
-     * <p>주의: 등록된 이벤트가 발생하지 않으면 내부 래퍼가 해제되지 않습니다. 장기 실행 환경에서 반복적으로 once()를 호출하면 메모리 누수가 발생할 수 있으므로,
-     * 필요 시 {@link #clear(ChatEvent)} 또는 {@link #off(ChatEvent, EventListener)}로 정리하세요.
+     * <p>여러 스레드에서 동시에 emit되어도 리스너는 정확히 한 번만 호출됩니다. 같은 리스너를 여러 번(또는 여러 이벤트에) 등록하면 등록마다 독립적으로 동작하며,
+     * {@link #off(ChatEvent, EventListener)}는 해당 이벤트의 등록을 하나씩 해제합니다. 이벤트가 발생하지 않으면 등록이 남아 있으므로 필요 시
+     * {@code off()}나 {@link #clear(ChatEvent)}로 정리하세요.
      */
-    @SuppressWarnings("unchecked")
     public <T extends BaseEvent> EventEmitter once(ChatEvent event, EventListener<T> listener) {
-        EventListener<T> wrapper =
-                new EventListener<T>() {
-                    @Override
-                    public void onEvent(T e) {
-                        off(event, this);
-                        onceWrappers.remove(listener);
-                        listener.onEvent(e);
-                    }
-                };
-        onceWrappers.put(listener, wrapper);
         listeners
                 .computeIfAbsent(event, _ -> new CopyOnWriteArrayList<>())
-                .add((EventListener<? extends BaseEvent>) wrapper);
+                .add(new OnceListener<>(event, listener));
         return this;
     }
 
-    @SuppressWarnings("unchecked")
+    /** 일반 리스너 또는 {@code once()}로 등록한 리스너를 해제합니다. 한 번 호출에 등록 하나만 해제합니다. */
     public <T extends BaseEvent> EventEmitter off(ChatEvent event, EventListener<T> listener) {
         List<EventListener<? extends BaseEvent>> list = listeners.get(event);
-        if (list != null) {
-            if (!list.remove(listener)) {
-                EventListener<?> wrapper = onceWrappers.remove(listener);
-                if (wrapper != null) {
-                    list.remove(wrapper);
-                }
+        if (list == null || list.remove(listener)) {
+            return this;
+        }
+        for (EventListener<? extends BaseEvent> registered : list) {
+            if (registered instanceof OnceListener<?> once
+                    && once.delegate == listener
+                    && list.remove(once)) {
+                break;
             }
         }
         return this;
@@ -113,7 +105,6 @@ public class EventEmitter {
 
     public void clear() {
         listeners.clear();
-        onceWrappers.clear();
     }
 
     public void clearInternal() {
@@ -121,10 +112,7 @@ public class EventEmitter {
     }
 
     public void clear(ChatEvent event) {
-        List<EventListener<? extends BaseEvent>> removed = listeners.remove(event);
-        if (removed != null) {
-            onceWrappers.entrySet().removeIf(entry -> removed.contains(entry.getValue()));
-        }
+        listeners.remove(event);
     }
 
     public boolean hasListeners(ChatEvent event) {
@@ -134,5 +122,29 @@ public class EventEmitter {
         }
         List<EventListener<? extends BaseEvent>> internal = internalListeners.get(event);
         return internal != null && !internal.isEmpty();
+    }
+
+    /** {@code once()} 등록 하나를 나타내는 래퍼. 동시 emit에서도 {@code fired}로 한 번만 위임합니다. */
+    private final class OnceListener<T extends BaseEvent> implements EventListener<T> {
+        private final ChatEvent event;
+        private final EventListener<T> delegate;
+        private final AtomicBoolean fired = new AtomicBoolean();
+
+        OnceListener(ChatEvent event, EventListener<T> delegate) {
+            this.event = event;
+            this.delegate = delegate;
+        }
+
+        @Override
+        public void onEvent(T e) {
+            if (!fired.compareAndSet(false, true)) {
+                return;
+            }
+            List<EventListener<? extends BaseEvent>> list = listeners.get(event);
+            if (list != null) {
+                list.remove(this);
+            }
+            delegate.onEvent(e);
+        }
     }
 }
