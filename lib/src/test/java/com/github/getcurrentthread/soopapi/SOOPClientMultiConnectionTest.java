@@ -4,7 +4,6 @@ import static org.junit.jupiter.api.Assertions.*;
 
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -16,18 +15,25 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import com.github.getcurrentthread.soopapi.client.SOOPChatClient;
+import com.github.getcurrentthread.soopapi.config.SOOPClientConfig;
+import com.github.getcurrentthread.soopapi.connection.FakeChatConnection;
+import com.github.getcurrentthread.soopapi.connection.FakeConnectionFactory;
 import com.github.getcurrentthread.soopapi.event.ChatEvent;
 import com.github.getcurrentthread.soopapi.event.StreamEventListener;
 import com.github.getcurrentthread.soopapi.event.model.ChatMessageEvent;
+import com.github.getcurrentthread.soopapi.event.model.DisconnectedEvent;
 import com.github.getcurrentthread.soopapi.event.model.ReconnectingEvent;
 
 public class SOOPClientMultiConnectionTest {
 
+    private FakeConnectionFactory factory;
     private SOOPClient client;
 
     @BeforeEach
     public void setup() {
-        client = new SOOPClient();
+        // 연결은 수립시키지 않는다. 세션이 계속 진행 중이라 재연결 테스트가 결정적이다.
+        factory = FakeConnectionFactory.async();
+        client = new SOOPClient(new SOOPClientConfig.Builder().build(), factory);
     }
 
     @AfterEach
@@ -180,8 +186,9 @@ public class SOOPClientMultiConnectionTest {
     }
 
     @Test
-    public void reconnect_existing_emitsReconnecting() throws Exception {
+    public void reconnect_existing_emitsReconnectingAndReplacesConnection() throws Exception {
         SOOPChatClient a = client.add("streamerA");
+        FakeChatConnection old = factory.last();
 
         CountDownLatch latch = new CountDownLatch(1);
         AtomicReference<ReconnectingEvent> received = new AtomicReference<>();
@@ -192,16 +199,15 @@ public class SOOPClientMultiConnectionTest {
                     latch.countDown();
                 });
 
-        // forceReconnect의 disconnect future는 새 connect 실패로 끝나므로 무시
-        try {
-            client.reconnect("streamerA");
-        } catch (CompletionException ignored) {
-        }
+        CompletableFuture<Void> session = client.reconnect("streamerA");
 
         assertTrue(latch.await(2, TimeUnit.SECONDS), "RECONNECTING should be emitted");
         assertEquals(1, received.get().attemptNumber());
         assertEquals(1, received.get().maxAttempts());
         assertEquals(0L, received.get().delayMs());
+        assertTrue(old.isClosed());
+        assertEquals(2, factory.created.size());
+        assertSame(a.connectToChat(), session, "reconnect keeps the session future");
     }
 
     @Test
@@ -224,12 +230,65 @@ public class SOOPClientMultiConnectionTest {
                     latch.countDown();
                 });
 
-        try {
-            client.reconnectAll();
-        } catch (CompletionException ignored) {
-        }
+        client.reconnectAll();
 
         assertTrue(latch.await(2, TimeUnit.SECONDS), "Each stream should emit RECONNECTING");
         assertEquals(2, total.get());
+        assertEquals(2, factory.live());
+    }
+
+    @Test
+    public void add_passesClientRetryLimitToStreams() {
+        try (SOOPClient limited =
+                new SOOPClient(
+                        new SOOPClientConfig.Builder().maxRetryAttempts(7).build(), factory)) {
+            limited.add("streamerA");
+            assertEquals(7, factory.last().config.getMaxRetryAttempts());
+        }
+    }
+
+    @Test
+    public void add_afterSessionEnded_startsNewSession() throws Exception {
+        SOOPChatClient a = client.add("streamerA");
+        CompletableFuture<Void> first = a.connectToChat();
+        a.disconnect();
+        first.get(2, TimeUnit.SECONDS);
+
+        assertSame(a, client.add("streamerA"));
+
+        assertEquals(2, factory.created.size());
+        assertNotSame(first, a.connectToChat());
+    }
+
+    @Test
+    public void remove_closesConnectionEvenIfListenerReconnects() throws Exception {
+        SOOPChatClient a = client.add("streamerA");
+        CountDownLatch disconnected = new CountDownLatch(1);
+        a.on(
+                ChatEvent.DISCONNECTED,
+                (DisconnectedEvent e) -> {
+                    a.connectToChat();
+                    disconnected.countDown();
+                });
+
+        client.remove("streamerA");
+
+        assertTrue(disconnected.await(2, TimeUnit.SECONDS));
+        assertEquals(1, factory.created.size(), "A removed stream must not reconnect");
+        assertEquals(0, factory.live());
+    }
+
+    @Test
+    public void close_leavesNoLiveConnections() throws Exception {
+        client.add("a");
+        client.add("b");
+        client.add("c");
+        factory.created.getFirst().establish();
+        client.reconnect("b");
+
+        client.close();
+
+        assertEquals(0, factory.live());
+        assertTrue(client.streamerIds().isEmpty());
     }
 }

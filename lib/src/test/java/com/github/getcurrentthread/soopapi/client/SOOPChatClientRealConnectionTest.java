@@ -1,5 +1,7 @@
 package com.github.getcurrentthread.soopapi.client;
 
+import static org.junit.jupiter.api.Assertions.assertAll;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
@@ -10,12 +12,13 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
+import java.util.Deque;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -33,6 +36,7 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.function.Executable;
 
 import com.github.getcurrentthread.soopapi.config.SOOPChatConfig;
 import com.github.getcurrentthread.soopapi.event.ChatEvent;
@@ -63,6 +67,14 @@ class SOOPChatClientRealConnectionTest {
     static final ConcurrentHashMap<ChatEvent, List<BaseEvent>> eventSamples =
             new ConcurrentHashMap<>();
 
+    /** 이 개수 안에서, 이 시간 안에 같은 raw가 다시 오면 중복 전달로 본다. 사용자가 같은 말을 반복한 경우는 보통 더 멀리 떨어져 있다. */
+    static final int DUPLICATE_WINDOW_MESSAGES = 10;
+
+    static final long DUPLICATE_WINDOW_MILLIS = 1_000;
+
+    /** 채팅 raw와 수신 시각. */
+    record SeenChat(String raw, long receivedAt) {}
+
     /** 스트림 하나의 전달 특성(순서, 동시 실행, 종료 후 유입, 재연결 중복)을 관찰한다. */
     static final class StreamProbe {
         final String bid;
@@ -73,7 +85,7 @@ class SOOPChatClientRealConnectionTest {
         final AtomicLong keepAlives = new AtomicLong();
         final AtomicLong eventsAfterDisconnect = new AtomicLong();
         final ConcurrentHashMap<ChatEvent, AtomicLong> lifecycle = new ConcurrentHashMap<>();
-        final Set<String> chatRawsAfterForce = ConcurrentHashMap.newKeySet();
+        final Deque<SeenChat> recentChatsAfterForce = new ArrayDeque<>();
         final AtomicLong duplicateChatsAfterForce = new AtomicLong();
         volatile boolean forced;
         volatile boolean disconnected;
@@ -96,22 +108,41 @@ class SOOPChatClientRealConnectionTest {
                         if (event.timestamp() < prev) {
                             chatOrderViolations.incrementAndGet();
                         }
-                        if (forced && !chatRawsAfterForce.add(event.raw())) {
-                            duplicateChatsAfterForce.incrementAndGet();
+                        if (forced) {
+                            checkDuplicate(event.raw());
                         }
                     }
                     default -> {}
+                }
+                // 세션이 끝난 뒤(DISCONNECTED 이후)에는 어떤 이벤트도 오면 안 된다.
+                if (disconnected) {
+                    eventsAfterDisconnect.incrementAndGet();
                 }
                 if (type == ChatEvent.DISCONNECTED
                         || type == ChatEvent.RECONNECTING
                         || type == ChatEvent.RECONNECTED
                         || type == ChatEvent.JOIN_CHANNEL) {
                     lifecycle.computeIfAbsent(type, _ -> new AtomicLong()).incrementAndGet();
-                } else if (disconnected && type != ChatEvent.RAW) {
-                    eventsAfterDisconnect.incrementAndGet();
+                }
+                if (type == ChatEvent.DISCONNECTED) {
+                    disconnected = true;
                 }
             } finally {
                 inFlight.decrementAndGet();
+            }
+        }
+
+        private synchronized void checkDuplicate(String raw) {
+            long now = System.currentTimeMillis();
+            for (SeenChat seen : recentChatsAfterForce) {
+                if (seen.raw().equals(raw) && now - seen.receivedAt() <= DUPLICATE_WINDOW_MILLIS) {
+                    duplicateChatsAfterForce.incrementAndGet();
+                    break;
+                }
+            }
+            recentChatsAfterForce.addLast(new SeenChat(raw, now));
+            if (recentChatsAfterForce.size() > DUPLICATE_WINDOW_MESSAGES) {
+                recentChatsAfterForce.removeFirst();
             }
         }
 
@@ -301,9 +332,11 @@ class SOOPChatClientRealConnectionTest {
                         forcedProbe.lifecycleCount(ChatEvent.RECONNECTED),
                         forcedProbe.duplicateChatsAfterForce.get()));
 
+        long disconnectsDuringForce =
+                forcedProbe.lifecycleCount(ChatEvent.DISCONNECTED) - disconnectsBeforeForce;
+
         // === 6단계: 모든 클라이언트 disconnect 후 유입 이벤트 관찰 ===
         for (int i = 0; i < clients.size(); i++) {
-            probes.get(i).disconnected = true;
             try {
                 clients.get(i).disconnect();
             } catch (Exception e) {
@@ -339,6 +372,49 @@ class SOOPChatClientRealConnectionTest {
 
         // === 8단계: 파싱 검증 리포트 생성 ===
         generateParsingReport();
+
+        // === 9단계: 전달 보장 판정 ===
+        List<Executable> checks = new ArrayList<>();
+        checks.add(() -> assertTrue(rejoined, "forceReconnect should rejoin"));
+        checks.add(
+                () ->
+                        assertEquals(
+                                0,
+                                disconnectsDuringForce,
+                                "forceReconnect must not emit DISCONNECTED"));
+        checks.add(
+                () ->
+                        assertEquals(
+                                1,
+                                forcedProbe.lifecycleCount(ChatEvent.RECONNECTED),
+                                "forceReconnect should emit RECONNECTED once"));
+        checks.add(
+                () ->
+                        assertEquals(
+                                0,
+                                forcedProbe.duplicateChatsAfterForce.get(),
+                                "No chat should be delivered twice after forceReconnect"));
+        for (StreamProbe probe : probes) {
+            checks.add(
+                    () ->
+                            assertEquals(
+                                    1,
+                                    probe.maxInFlight.get(),
+                                    "[" + probe.bid + "] listeners must not run concurrently"));
+            checks.add(
+                    () ->
+                            assertEquals(
+                                    1,
+                                    probe.lifecycleCount(ChatEvent.DISCONNECTED),
+                                    "[" + probe.bid + "] one DISCONNECTED per session"));
+            checks.add(
+                    () ->
+                            assertEquals(
+                                    0,
+                                    probe.eventsAfterDisconnect.get(),
+                                    "[" + probe.bid + "] no events after DISCONNECTED"));
+        }
+        assertAll(checks);
 
         logger.info("=== Test complete ===");
     }

@@ -1,168 +1,52 @@
 package com.github.getcurrentthread.soopapi.connection;
 
-import java.util.Map;
-import java.util.concurrent.*;
-import java.util.logging.Level;
-import java.util.logging.Logger;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 
 import com.github.getcurrentthread.soopapi.config.SOOPChatConfig;
 import com.github.getcurrentthread.soopapi.event.EventEmitter;
-import com.github.getcurrentthread.soopapi.exception.ConnectionException;
-import com.github.getcurrentthread.soopapi.model.ConnectionStatus;
+import com.github.getcurrentthread.soopapi.util.SerialExecutor;
 
-public class ConnectionManager {
-    private static final Logger LOGGER = Logger.getLogger(ConnectionManager.class.getName());
+/**
+ * 모든 채팅 연결이 공유하는 실행 자원과 기본 {@link ChatConnectionFactory}.
+ *
+ * <p>연결 자체는 소유하지 않습니다. 연결은 {@link com.github.getcurrentthread.soopapi.client.SOOPChatClient}가 세션마다
+ * 만들고 닫습니다. 스레드는 모두 데몬(가상 스레드 포함)이라 JVM 종료를 막지 않으므로 별도의 종료 절차가 없습니다.
+ */
+public final class ConnectionManager implements ChatConnectionFactory {
 
     private static final class Holder {
         static final ConnectionManager INSTANCE = new ConnectionManager();
     }
 
-    private final ExecutorService messageProcessorPool;
-    private final ScheduledExecutorService sharedScheduler;
-    private final Map<String, SOOPConnection> connections;
-    private volatile boolean isShutdown;
+    private final ExecutorService pool = Executors.newVirtualThreadPerTaskExecutor();
+    private final ScheduledThreadPoolExecutor scheduler;
 
     private ConnectionManager() {
-        this.messageProcessorPool = Executors.newVirtualThreadPerTaskExecutor();
-
-        this.sharedScheduler =
-                Executors.newScheduledThreadPool(
+        scheduler =
+                new ScheduledThreadPoolExecutor(
                         1,
                         r -> {
                             Thread t = new Thread(r, "SOOP-Scheduler");
                             t.setDaemon(true);
                             return t;
                         });
-
-        this.connections = new ConcurrentHashMap<>();
-
-        Runtime.getRuntime()
-                .addShutdownHook(
-                        new Thread(
-                                () -> {
-                                    for (SOOPConnection conn : connections.values()) {
-                                        try {
-                                            conn.disconnect();
-                                        } catch (Exception e) {
-                                            LOGGER.log(
-                                                    Level.WARNING,
-                                                    "Error disconnecting during shutdown",
-                                                    e);
-                                        }
-                                    }
-                                    connections.clear();
-                                    shutdownExecutors();
-                                },
-                                "SOOP-ShutdownHook"));
+        scheduler.setRemoveOnCancelPolicy(true);
     }
 
     public static ConnectionManager getInstance() {
         return Holder.INSTANCE;
     }
 
-    public CompletableFuture<SOOPConnection> connect(
-            SOOPChatConfig config, EventEmitter eventEmitter) {
-        if (isShutdown) {
-            return CompletableFuture.failedFuture(
-                    new ConnectionException(
-                            "ConnectionManager has been shut down and cannot accept new connections"));
-        }
-        String bid = config.getBid();
-
-        return CompletableFuture.supplyAsync(
-                () -> {
-                    SOOPConnection connection =
-                            connections.computeIfAbsent(
-                                    bid,
-                                    _ ->
-                                            new SOOPConnection(
-                                                    config,
-                                                    messageProcessorPool,
-                                                    sharedScheduler,
-                                                    eventEmitter));
-                    try {
-                        connection.connect().join();
-                        return connection;
-                    } catch (Exception e) {
-                        connections.computeIfPresent(
-                                bid, (_, conn) -> conn.isConnected() ? conn : null);
-                        LOGGER.log(Level.SEVERE, "Connection failed: " + bid, e);
-                        throw new CompletionException(
-                                new ConnectionException("Cannot connect to channel: " + bid, e));
-                    }
-                },
-                messageProcessorPool);
+    @Override
+    public ChatConnection createConnection(
+            SOOPChatConfig config, EventEmitter emitter, SerialExecutor lane) {
+        return new SOOPConnection(config, scheduler, emitter, lane);
     }
 
-    public SOOPConnection getConnection(String bid) {
-        return connections.get(bid);
-    }
-
-    public CompletableFuture<ConnectionStatus> getConnectionStatus(String bid) {
-        SOOPConnection connection = connections.get(bid);
-        if (connection == null) {
-            return CompletableFuture.completedFuture(new ConnectionStatus(false, false, 0));
-        }
-
-        return connection
-                .getStatus()
-                .thenApply(
-                        status ->
-                                new ConnectionStatus(
-                                        connection.isConnected(),
-                                        status.reconnecting(),
-                                        status.retryCount()));
-    }
-
-    public CompletableFuture<Void> disconnect(String bid) {
-        return CompletableFuture.runAsync(
-                () -> {
-                    SOOPConnection connection = connections.remove(bid);
-                    if (connection != null) {
-                        connection.disconnect();
-                    }
-                },
-                messageProcessorPool);
-    }
-
-    public CompletableFuture<Void> shutdown() {
-        isShutdown = true;
-        return CompletableFuture.runAsync(
-                () -> {
-                    try (var disconnectExecutor = Executors.newVirtualThreadPerTaskExecutor()) {
-                        for (SOOPConnection conn : connections.values()) {
-                            disconnectExecutor.submit(
-                                    () -> {
-                                        try {
-                                            conn.disconnect();
-                                        } catch (Exception e) {
-                                            LOGGER.log(
-                                                    Level.WARNING,
-                                                    "Error disconnecting during shutdown",
-                                                    e);
-                                        }
-                                        return null;
-                                    });
-                        }
-                    }
-                    connections.clear();
-                    shutdownExecutors();
-                });
-    }
-
-    private void shutdownExecutors() {
-        messageProcessorPool.shutdown();
-        sharedScheduler.shutdown();
-        try {
-            if (!messageProcessorPool.awaitTermination(5, TimeUnit.SECONDS)) {
-                messageProcessorPool.shutdownNow();
-            }
-            if (!sharedScheduler.awaitTermination(5, TimeUnit.SECONDS)) {
-                sharedScheduler.shutdownNow();
-            }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            LOGGER.log(Level.WARNING, "Interrupted during shutdown", e);
-        }
+    @Override
+    public SerialExecutor newLane() {
+        return new SerialExecutor(pool);
     }
 }

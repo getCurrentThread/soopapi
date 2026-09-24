@@ -86,6 +86,11 @@ public class SOOPHttpClient implements AutoCloseable {
         return httpClient;
     }
 
+    /** 새 요청을 받지 않도록 하고 즉시 반환합니다. 진행 중인 요청은 끝까지 처리됩니다. */
+    public void shutdown() {
+        httpClient.shutdown();
+    }
+
     @Override
     public void close() {
         httpClient.close();

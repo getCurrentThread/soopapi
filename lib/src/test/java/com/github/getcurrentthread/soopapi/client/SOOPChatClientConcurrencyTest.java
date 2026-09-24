@@ -11,6 +11,7 @@ import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 
 import com.github.getcurrentthread.soopapi.config.SOOPChatConfig;
+import com.github.getcurrentthread.soopapi.connection.FakeConnectionFactory;
 
 class SOOPChatClientConcurrencyTest {
 
@@ -18,8 +19,9 @@ class SOOPChatClientConcurrencyTest {
     void concurrentConnectToChat_returnsSameFuture() throws Exception {
         SOOPChatConfig config =
                 new SOOPChatConfig.Builder().bid("testConcurrency").bno("99999").build();
+        FakeConnectionFactory factory = FakeConnectionFactory.async();
 
-        SOOPChatClient client = new SOOPChatClient(config);
+        SOOPChatClient client = new SOOPChatClient(config, factory);
 
         int threads = 10;
         CountDownLatch startLatch = new CountDownLatch(1);
@@ -44,18 +46,16 @@ class SOOPChatClientConcurrencyTest {
         startLatch.countDown();
         assertTrue(doneLatch.await(10, TimeUnit.SECONDS), "All threads should complete");
 
-        // ReentrantLock이 disconnectFuture가 하나만 생성되도록 보장한다.
-        // 첫 번째 호출이 isConnected=true를 설정(또는 disconnectFuture를 생성)한 후,
-        // 이후 호출들은 동일한 future를 반환해야 한다.
-        // 실제 ConnectionManager가 유효하지 않은 bid에 연결을 시도하므로 모든 호출이
-        // 실패할 가능성이 높지만, 여전히 동일한 disconnectFuture를 공유해야 한다.
+        // 연결을 수립시키지 않으므로 세션이 계속 진행 중이다. 모든 호출이 같은 세션을 봐야 한다.
         assertEquals(
                 1,
                 futures.size(),
-                "Concurrent connectToChat() should return the same disconnectFuture, got "
+                "Concurrent connectToChat() should return the same session future, got "
                         + futures.size()
                         + " distinct futures");
+        assertEquals(1, factory.created.size(), "Only one connection should be created");
 
         client.disconnect();
+        assertEquals(0, factory.live());
     }
 }
